@@ -2,6 +2,9 @@
 LogTheLogger is an Open Source Discord Bot for Logging onto another Discord Server
 Currently Work-In-Progress
 
+## Discord Server
+https://discord.gg/mpgbu3M5Yy
+
 ## How to setup
 1. Invite the Bot on both servers
 2. Execute on both servers the /setup command
