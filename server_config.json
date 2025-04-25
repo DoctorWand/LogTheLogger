@@ -3,7 +3,6 @@
         "logChannel": 0,
         "logForwarding": true,
         "onlyForwarding": false,
-        "logSendingToServerId": 0,
-        "logSendingToServerChannel": 0
+        "logSendingToServerId": []
     }
 }

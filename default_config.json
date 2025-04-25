@@ -1,5 +1,5 @@
 {
-    "botVersion": 0.0,
+    "botVersion": "1.0",
     "discordToken": "Put your token here",
     "discordServer": 0,
     "discordStatusChannel": 0,
