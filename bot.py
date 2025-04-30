@@ -65,11 +65,13 @@ if os.path.exists("D:/BotExtentions/LogTheLogger/ltl-bot.json"):
     main_statusChannel = extentionConfig["discordBotStatus"]
     token = extentionConfig["discordToken"]
     bot_owner = extentionConfig["botOwner"]
+    maintenance = extentionConfig["maintenanceMode"]
 else:
     main_server = defaultConfig["discordServer"]
     main_statusChannel = defaultConfig["discordStatusChannel"]
     token = defaultConfig["discordToken"]
     bot_owner = defaultConfig["botOwner"]
+    maintenance = defaultConfig["maintenanceMode"]
 
 
 # Save n' Load Server-Config
@@ -92,17 +94,23 @@ class DiscordBot(commands.Bot):
     async def on_ready(self):
         startup_time_start = time.time()
         bot_commands(self)
-        loops(self)
+        logging.info("~Start Syncing Guilds~")
         for guild in self.guilds:
-            try:
-                await self.tree.sync(guild=discord.Object(id=guild.id))
-                logger.info(f"Synced {guild.name} successfully")
-            except Exception as e:
-                logger.error(f"{guild.name} | Error: {e}")
+            if guild.id == 846869213732929536:
+                self.tree.copy_global_to(guild=discord.Object(id=846869213732929536))
+                await self.tree.sync(guild=discord.Object(id=846869213732929536))
+        try:
+            await self.tree.sync()
+            logger.info(f"Synced Commands successfully")
+        except Exception as e:
+            logger.error(f"Sync Commands | Error: {e}")
+            raise e
+        logging.info("~End Syncing Guilds~")
+        loops(self)
         startup_time_finish = time.time()
         startup_time = round((startup_time_finish - startup_time_start)*1000,2)
         logger.info(f"Bot startup successfully | Startup-Time: {startup_time} Milliseconds.")
-        if main_statusChannel != 0:
+        if main_statusChannel != 0 and maintenance == False:
             return await DiscordBot.send_status(self,"**Bot Online**",f"Startup-Time: {startup_time} Milliseconds.")
 
     
@@ -116,15 +124,18 @@ class DiscordBot(commands.Bot):
             for embed in message.embeds:
                 for guild in serverConfig[guild]["logSendingToServerId"]:
                     await self.forwarding_embeds(guild,embed,message.guild.id)
+        return
 
 
     async def on_guild_join(self,guild):
-        logger.info(f"Start Syncing new Guild {guild.name} ...")
+        self.wait_until_ready()
+        logger.info(f"~~~Start Syncing new Guild: [{guild.name}] ...~~~")
         try:
-            await self.tree.sync(guild=guild)
-            logger.info(f"Synced new Guild {guild.name} successfully")
+            await self.tree.sync(guild=discord.Object(id=guild.id))
+            logger.info(f"~~~Synced new Guild: [{guild.name}] successfully~~~")
         except Exception as e:
-            logger.error(f"Sync failed for Guild {guild.name} , Error: {e}")
+            logger.error(f"~~~Sync failed for Guild: [{guild.name}] , Error: {e}~~~")
+        return
 
 
     async def send_status(self,status,info):
@@ -169,10 +180,10 @@ def loops(client):
         
 # Slash Commands
 def bot_commands(client):
-    @client.tree.command(name="setup",description="Initial Setup.",guilds=list(client.guilds))
+    @client.tree.command(name="ltl_setup",description="Initial Setup.")
     @app_commands.checks.has_permissions(manage_webhooks=True) #discord.Permissions.manage_webhooks
     @app_commands.describe(logchannel = "The Channel where logs are getting send to.")
-    async def setup(interaction: discord.Interaction, logchannel: discord.TextChannel):
+    async def ltl_setup(interaction: discord.Interaction, logchannel: discord.TextChannel):
         guild = str(interaction.guild_id)
         if guild in serverConfig:
             return await interaction.response.send_message(content="Setup was already executed")
@@ -186,7 +197,18 @@ def bot_commands(client):
         await client.send_logs(int(guild),"Setup","completed successfully")
         return await interaction.response.send_message(content=f"Setup was completed for ***{interaction.guild}*** | ***{guild}***")
 
-    @client.tree.command(name="forwarding",description="Enable/Disable Log Forwarding",guilds=list(client.guilds))
+    @client.tree.command(name="ltl_revoke_setup",description="Cleares the Setup if you messed up")
+    @app_commands.checks.has_permissions(manage_webhooks=True)
+    async def ltlRevokeSetup(interaction: discord.Interaction):
+        guild = str(interaction.guild.id)
+        load_server_config()
+        if guild not in serverConfig:
+            return await interaction.response.send_message(content="The /setup command wasn't executed yet!")
+        serverConfig.pop(guild)
+        save_server_config()
+        return await interaction.response.send_message(content="Setup was revoked successfully")
+
+    @client.tree.command(name="forwarding",description="Enable/Disable Log Forwarding")
     @app_commands.checks.has_permissions(manage_webhooks=True)
     async def forwarding(interaction: discord.Interaction, forwarding: bool=True):
         guild = str(interaction.guild_id)
@@ -199,7 +221,7 @@ def bot_commands(client):
         await client.send_logs(int(guild),"Forwarding",f"Statement is now: {forwarding}")
         return await interaction.response.send_message(content=f"Forwarding Statement is now: {forwarding}")
 
-    @client.tree.command(name="forwarding-server",description="The Server you want to get it forwarded",guilds=list(client.guilds))
+    @client.tree.command(name="forwarding-server",description="The Server you want to get it forwarded")
     @app_commands.checks.has_permissions(manage_webhooks=True)
     async def forwardingServer(interaction: discord.Interaction, server_id: str):
         if server_id.isdigit() == False:
@@ -221,7 +243,7 @@ def bot_commands(client):
         await client.send_logs(guild,"Forwarding-Server",f"{client.get_guild(server_id).name} was added to the forwarding list")
         return await interaction.response.send_message(content=f"The Server {client.get_guild(server_id).name} | {server_id} was added successfully")
     
-    @client.tree.command(name="delete-forwarding-server",description="Delets a Server from the forwarding list",guilds=list(client.guilds))
+    @client.tree.command(name="delete-forwarding-server",description="Delets a Server from the forwarding list")
     @app_commands.checks.has_permissions(manage_webhooks=True)
     async def deleteForwardingServer(interaction: discord.Interaction, server_id: str):
         if server_id.isdigit() == False:
@@ -234,7 +256,7 @@ def bot_commands(client):
         await client.send_logs(guild,"Forwarding-Server",f"{client.get_guild(server_id).name} was removed to the forwarding list")
         return await interaction.response.send_message(content=f"The Server {client.get_guild(server_id).name} | {server_id} was removed from the forwarding list")
 
-    @client.tree.command(name="dev-discord",description="Get an Invite to the Devs Discord server.",guilds=list(client.guilds))
+    @client.tree.command(name="dev-discord",description="Get an Invite to the Devs Discord server.")
     async def dev_discord(interaction: discord.Interaction):
         return await interaction.response.send_message(content=defaultConfig["discordInvite"],ephemeral=True)
 
@@ -258,9 +280,25 @@ def bot_commands(client):
         if state:
             embed = get_embed("Maintenance",f"Bot will go into Maintenance for {maintenance_time} Minutes")
             embed.color = discord.Colour.from_rgb(230,170,42)
+            if os.path.exists("D:/BotExtentions/LogTheLogger/ltl-bot.json"):
+                extentionConfig["maintenanceMode"] = state
+                with open("D:/BotExtentions/LogTheLogger/ltl-bot.json","w",encoding="utf-8") as nsc:
+                    json.dump(extentionConfig,nsc)
+            else:
+                defaultConfig["maintenanceMode"] = state
+                with open("default_config.json","w",encoding="utf-8") as nsc:
+                    json.dump(defaultConfig,nsc)
         else:
             embed = get_embed("Maintenance",f"Bot back Online after {maintenance_time} Minutes")
             embed.color = discord.Colour.from_rgb(50,200,64)
+            if os.path.exists("D:/BotExtentions/LogTheLogger/ltl-bot.json"):
+                extentionConfig["maintenanceMode"] = state
+                with open("D:/BotExtentions/LogTheLogger/ltl-bot.json","w",encoding="utf-8") as nsc:
+                    json.dump(extentionConfig,nsc)
+            else:
+                defaultConfig["maintenanceMode"] = state
+                with open("default_config.json","w",encoding="utf-8") as nsc:
+                    json.dump(defaultConfig,nsc)
         await channel.send(embed=embed)
         return await interaction.response.send_message(content="Maintenance message was delivered")
 
