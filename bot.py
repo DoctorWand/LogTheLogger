@@ -118,6 +118,15 @@ class DiscordBot(commands.Bot):
                     await self.forwarding_embeds(guild,embed,message.guild.id)
 
 
+    async def on_guild_join(self,guild):
+        logger.info(f"Start Syncing new Guild {guild.name} ...")
+        try:
+            await self.tree.sync(guild=guild)
+            logger.info(f"Synced new Guild {guild.name} successfully")
+        except Exception as e:
+            logger.error(f"Sync failed for Guild {guild.name} , Error: {e}")
+
+
     async def send_status(self,status,info):
         channel = self.get_guild(main_server).get_channel(main_statusChannel)
         embed = get_embed(status,info)
@@ -272,6 +281,7 @@ def run_discord_bot():
     intents.message_content = True
     intents.members = True
     intents.presences = True
+    intents.guilds = True
     client = DiscordBot(command_prefix="!",intents=intents,server=main_server,statusChannel=main_statusChannel)
 
     client.run(token)
