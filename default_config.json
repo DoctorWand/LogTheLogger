@@ -3,5 +3,6 @@
     "discordToken": "Put your token here",
     "discordServer": 0,
     "discordStatusChannel": 0,
+    "botOwner": 0,
     "discordInvite": "https://discord.gg/mpgbu3M5Yy"
 }

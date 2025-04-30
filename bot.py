@@ -64,10 +64,12 @@ if os.path.exists("D:/BotExtentions/LogTheLogger/ltl-bot.json"):
     main_server = extentionConfig["discordDevServer"]
     main_statusChannel = extentionConfig["discordBotStatus"]
     token = extentionConfig["discordToken"]
+    bot_owner = extentionConfig["botOwner"]
 else:
     main_server = defaultConfig["discordServer"]
     main_statusChannel = defaultConfig["discordStatusChannel"]
     token = defaultConfig["discordToken"]
+    bot_owner = defaultConfig["botOwner"]
 
 
 # Save n' Load Server-Config
@@ -237,6 +239,8 @@ def bot_commands(client):
     @client.tree.command(name="maintenance",description="Send a notification to the status channel",guild=discord.Object(id=main_server))
     @app_commands.checks.has_permissions(manage_webhooks=True)
     async def maintenance(interaction: discord.Interaction,state: bool,time:int=0):
+        if interaction.user.id != bot_owner:
+            return await interaction.response.send_message(content="Only the Bot Owner is allowed todo this",ephemeral=True)
         channel = client.get_channel(main_statusChannel)
         if time == 0:
             maintenance_time = "Unknown"
