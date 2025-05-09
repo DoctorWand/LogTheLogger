@@ -170,13 +170,11 @@ class DiscordBot(commands.Bot):
 
     async def send_logs(self,guild:int,title:str,log:str):
         load_server_config()
-        guild = str(guild)
-        if serverConfig[guild]["onlyForwarding"]:
-            return
         guild = self.get_guild(int(guild))
         channel = guild.get_channel(serverConfig[str(guild.id)]["logChannel"])
         embed = get_embed(title,log)
         embed.set_author(name=guild.name,icon_url=guild.icon)
+        guild = str(guild.id)
         if not serverConfig[guild]["onlyForwarding"]:
             await channel.send(embed=embed)
         for forwardingGuild in serverConfig[guild]["logSendingToServerId"]:
@@ -185,6 +183,8 @@ class DiscordBot(commands.Bot):
         
 
     async def forwarding_embeds(self,guild:int,embed:discord.Embed,fromGuild:int):
+        if str(guild) not in serverConfig:
+            return
         guild = self.get_guild(guild)
         fromGuild = self.get_guild(fromGuild)
         channel = guild.get_channel(serverConfig[str(guild.id)]["logChannel"])
@@ -205,8 +205,8 @@ def loops(client):
         clean_old_logs(LOG_DIR,BASE_LOG_NAME,RETENTION_DAYS)
         logger.info(f"Checked for Old Logs - {datetime.datetime.now(pytz.timezone("Europe/Berlin")).strftime("%d.%m.%Y | %H:%M:%S")}")
 
-    check_service.start()
-    clear_old_logs.start()
+    check_service.start(client)
+    clear_old_logs.start(client)
         
 # Slash Commands
 def bot_commands(client):
@@ -214,7 +214,7 @@ def bot_commands(client):
     @app_commands.checks.has_permissions(manage_webhooks=True) #discord.Permissions.manage_webhooks
     @app_commands.describe(logchannel = "The Channel where logs are getting send to.")
     async def ltl_setup(interaction: discord.Interaction, logchannel: discord.TextChannel):
-        guild = str(interaction.guild_id)
+        guild = str(interaction.guild.id)
         if guild in serverConfig:
             return await interaction.response.send_message(content="Setup was already executed")
         load_server_config()
@@ -242,7 +242,7 @@ def bot_commands(client):
     @client.tree.command(name="forwarding",description="Enable/Disable Log Forwarding")
     @app_commands.checks.has_permissions(manage_webhooks=True)
     async def forwarding(interaction: discord.Interaction, forwarding: bool=True):
-        guild = str(interaction.guild_id)
+        guild = str(interaction.guild.id)
         if guild not in serverConfig:
             return await interaction.response.send_message(content="The /setup command wasn't executed yet!")
         load_server_config()
@@ -257,6 +257,8 @@ def bot_commands(client):
     async def forwardingServer(interaction: discord.Interaction, server_id: str):
         if server_id.isdigit() == False:
             return await interaction.response.send_message(content="Please enter a server id and not a server name")
+        if interaction.guild.id == int(server_id):
+            return await interaction.response.send_message(content="Forwarding Logs onto the same Server isn't possible",ephemeral=True)
         guild = str(interaction.guild.id)
         load_server_config()
         if guild not in serverConfig:
