@@ -17,10 +17,10 @@ from logging.handlers import TimedRotatingFileHandler
 # Setup file logging
 LOG_DIR = "Logs"
 BASE_LOG_NAME = "JASTBI-LogTheLogger"
-RETENTION_DAYS = 7
+RETENTION_DAYS = 8
 os.makedirs(LOG_DIR,exist_ok=True)
 today_str = datetime.datetime.now(pytz.timezone("Europe/Berlin")).strftime("%d.%m.%Y")
-log_name = f"{BASE_LOG_NAME}-{today_str}.log"
+log_name = f"{BASE_LOG_NAME}.{today_str}.log"
 log_path = os.path.join(LOG_DIR,log_name)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -41,7 +41,7 @@ if not logger.hasHandlers():
 # Clear Old Logs
 def clean_old_logs(directory, base_name, retention_days, timezone="Europe/Berlin"):
     cutoff = datetime.datetime.now(pytz.timezone(timezone)) - datetime.timedelta(days=retention_days)
-    pattern = re.compile(rf"{re.escape(base_name)}-(\d{{2}}.\d{{2}}.\d{{4}})\.log")
+    pattern = re.compile(rf"{re.escape(base_name)}.(\d{{2}}.\d{{2}}.\d{{4}})\.log")
     logs_deleted = False
 
     for filename in os.listdir(directory):
@@ -64,7 +64,7 @@ def clean_old_logs(directory, base_name, retention_days, timezone="Europe/Berlin
     
     if not logs_deleted:
         print(f"No old logs found - {datetime.datetime.now()}")
-        logger.info(f"No old logs found - {datetime.datetime.now()}")
+        logger.info("No old logs found")
 
 
 global main_server
@@ -293,14 +293,14 @@ def bot_commands(client):
     async def ltlHelp(interaction: discord.Interaction):
         embed = get_embed("Help",
             "Here you will find the information for the bot.\n\n"
-            "How to Setup?\n"
+            "**How to Setup?**\n"
             "1. On both Server execute the 'ltl_setup' command and enter your log channel\n"
             "2. For Server A execute the 'forwarding-server' command and enter Server Bs ID\n"
             "a. You will find the ID by right clicking Server B and then click on 'copy Server-ID'\n"
             "b. If you can't see the 'copy Server-ID' then you have to activate developer mode under your settings\n\n"
-            "Which Permission do I need?\n"
+            "**Which Permission do I need?**\n"
             "For most of the Commands you need the 'Managed Webhooks' permission")
-
+        return await interaction.response.send_message(embed=embed)
 
     @client.tree.command(name="dev-discord",description="Get an Invite to the Devs Discord server.")
     async def dev_discord(interaction: discord.Interaction):
