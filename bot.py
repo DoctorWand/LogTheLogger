@@ -79,8 +79,8 @@ with open("default_config.json",encoding="utf-8") as dc:
 with open("server_config.json",encoding="utf-8") as sc:
     serverConfig = json.load(sc)
 
-if os.path.exists("D:/BotExtentions/LogTheLogger/ltl-bot.json"):
-    with open("D:/BotExtentions/LogTheLogger/ltl-bot.json", encoding="utf-8") as beltl:
+if os.path.exists("E:/BotExtentions/LogTheLogger/ltl-bot.json"):
+    with open("E:/BotExtentions/LogTheLogger/ltl-bot.json", encoding="utf-8") as beltl:
         extentionConfig = json.load(beltl)
     
     main_server = extentionConfig["discordDevServer"]
@@ -114,7 +114,11 @@ def get_embed(title:str,description:str) -> discord.Embed:
 class DiscordBot(commands.Bot):
     async def on_ready(self):
         startup_time_start = time.time()
-        bot_commands(self)
+        try:
+            bot_commands(self)
+        except Exception as e:
+            logger.error(f"Adding Commands Error: {e}")
+            raise e
         logging.info("~Start Syncing Guilds~")
         for guild in self.guilds:
             if guild.id == 846869213732929536:
@@ -195,18 +199,18 @@ class DiscordBot(commands.Bot):
 # Automation Tasks
 def loops(client):
     @loop(hours=24)
-    async def check_service(client): # TODO
+    async def check_service(): # TODO
         if main_server == 1345495816202227752 or defaultConfig["discordInvite"] != "https://discord.gg/mpgbu3M5Yy":
             return
         return
     
     @loop(hours=12)
-    async def clear_old_logs(client):
+    async def clear_old_logs():
         clean_old_logs(LOG_DIR,BASE_LOG_NAME,RETENTION_DAYS)
         logger.info(f"Checked for Old Logs - {datetime.datetime.now(pytz.timezone("Europe/Berlin")).strftime("%d.%m.%Y | %H:%M:%S")}")
 
-    check_service.start(client)
-    clear_old_logs.start(client)
+    check_service.start()
+    clear_old_logs.start()
         
 # Slash Commands
 def bot_commands(client):
@@ -326,9 +330,9 @@ def bot_commands(client):
         if state:
             embed = get_embed("Maintenance",f"Bot will go into Maintenance for {maintenance_time} Minutes")
             embed.color = discord.Colour.from_rgb(230,170,42)
-            if os.path.exists("D:/BotExtentions/LogTheLogger/ltl-bot.json"):
+            if os.path.exists("E:/BotExtentions/LogTheLogger/ltl-bot.json"):
                 extentionConfig["maintenanceMode"] = state
-                with open("D:/BotExtentions/LogTheLogger/ltl-bot.json","w",encoding="utf-8") as nsc:
+                with open("E:/BotExtentions/LogTheLogger/ltl-bot.json","w",encoding="utf-8") as nsc:
                     json.dump(extentionConfig,nsc)
             else:
                 defaultConfig["maintenanceMode"] = state
@@ -337,9 +341,9 @@ def bot_commands(client):
         else:
             embed = get_embed("Maintenance",f"Bot back Online after {maintenance_time} Minutes")
             embed.color = discord.Colour.from_rgb(50,200,64)
-            if os.path.exists("D:/BotExtentions/LogTheLogger/ltl-bot.json"):
+            if os.path.exists("E:/BotExtentions/LogTheLogger/ltl-bot.json"):
                 extentionConfig["maintenanceMode"] = state
-                with open("D:/BotExtentions/LogTheLogger/ltl-bot.json","w",encoding="utf-8") as nsc:
+                with open("E:/BotExtentions/LogTheLogger/ltl-bot.json","w",encoding="utf-8") as nsc:
                     json.dump(extentionConfig,nsc)
             else:
                 defaultConfig["maintenanceMode"] = state
