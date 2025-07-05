@@ -4,6 +4,7 @@ This is the Roadmap for the Bot / Project
 ## Version 1.0
 - [x] Forwarding logs
 - [ ] QoL , cleaning code & bug fixes
+- [ ] Automatic checks for updates for self hosted instances
 
 ## Version 2.0
 ### Structure Change (tbd - to be decided)
@@ -18,3 +19,4 @@ Logging -
 ## Version 3.0
 ### Integrated Features
 - [ ] Ticket System
+- [ ] Web Dashboard
