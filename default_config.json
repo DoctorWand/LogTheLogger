@@ -1,5 +1,6 @@
 {
-    "botVersion": "1.0.4",
+    "botVersion": "2.0.0",
+    "autoUpdate": false,
     "discordToken": "Put your token here",
     "discordServer": 0,
     "discordStatusChannel": 0,
