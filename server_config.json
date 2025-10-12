@@ -1,8 +1,0 @@
-{
-    "Example": {
-        "logChannel": 0,
-        "logForwarding": true,
-        "onlyForwarding": false,
-        "logSendingToServerId": []
-    }
-}
