@@ -317,7 +317,7 @@ class DiscordBot(commands.Bot):
 
         guild = self.get_guild(guild_id)
         
-        log = f"**User ID:** {payload.user_id}\n**Member Count:** {guild.member_count}"
+        log = f"**User ID:** {payload.user.id}\n**Member Count:** {guild.member_count}"
         await self.send_logs(guild_id, "Member Left", log)
         return
     
