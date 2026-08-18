@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"D:/Dev/Python 3.12.4/Python/Scripts/graphify.EXE\" hook-guard search"
+          }
+        ]
+      },
+      {
+        "matcher": "Read|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"D:/Dev/Python 3.12.4/Python/Scripts/graphify.EXE\" hook-guard read"
+          }
+        ]
+      }
+    ]
+  }
+}

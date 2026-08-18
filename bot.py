@@ -3,6 +3,7 @@ import discord
 import json
 import time
 import datetime
+import difflib
 import os
 import re
 import logging
@@ -14,6 +15,10 @@ from discord.ext import commands
 from discord.ext.tasks import loop
 from logging.handlers import TimedRotatingFileHandler
 from db_handler import db
+try:
+    from heartbeat import Heartbeat
+except ImportError:
+    Heartbeat = None
 
 # Setup file logging
 if not os.path.exists("F:/DiscordBotsData/LogTheLogger/Logs"):
@@ -25,17 +30,18 @@ RETENTION_DAYS = 8
 TIMEZONE = "Europe/Berlin"
 
 os.makedirs(LOG_DIR,exist_ok=True)
-today_str = datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime("%d.%m.%Y")
-log_name = f"{BASE_LOG_NAME}.{today_str}.log"
-log_path = os.path.join(LOG_DIR,log_name)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 if not logger.hasHandlers():
+    # backupCount=0 disables the handler's own (system-local-time-based) deletion.
+    # clean_old_logs() is the single source of truth for retention, using TIMEZONE
+    # explicitly - two independent cleanup schedules previously caused stale files
+    # to stick around or vanish at the wrong time depending on the host's system clock.
     handler = TimedRotatingFileHandler(
         filename=os.path.join(LOG_DIR,BASE_LOG_NAME),
         when="midnight",
         interval=1,
-        backupCount=RETENTION_DAYS,
+        backupCount=0,
         encoding="utf-8",
         utc=False
     )
@@ -96,10 +102,55 @@ else:
     bot_owner = defaultConfig["botOwner"]
     maintenance = defaultConfig["maintenanceMode"]
 
+if Heartbeat is not None:
+    # Heartbeat/HealthCheck Server
+    HEALTH_CHECK_PORT = 8000
+    heartbeat_instance: Heartbeat | None = None
+
 # Getting base embed
 def get_embed(title:str,description:str) -> discord.Embed:
-    embed = discord.Embed(title=title,description=description,timestamp=datetime.datetime.now())
+    # Must be timezone-aware: a naive datetime gets serialized without a UTC offset,
+    # so Discord assumes UTC on display - on a host not running in UTC this silently
+    # shifted every logged timestamp by the host's offset (occasionally showing as
+    # a log from hours in the past/future).
+    embed = discord.Embed(title=title,description=description,timestamp=datetime.datetime.now(datetime.timezone.utc))
     return embed
+
+# Builds a clickable jump-to-message link
+def build_message_link(guild_id: int, channel_id: int, message_id: int) -> str:
+    return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+
+# Word-level diff between the old and new content of an edited message.
+# Falls back to None (caller should show full Before/After) when the change
+# is too large to summarize usefully as a word diff.
+MAX_WORD_DIFF_CHANGES = 6
+
+def diff_message_content(before: str, after: str) -> str | None:
+    before_words = before.split()
+    after_words = after.split()
+    matcher = difflib.SequenceMatcher(None, before_words, after_words)
+
+    parts = []
+    changed_word_count = 0
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        removed = before_words[i1:i2]
+        added = after_words[j1:j2]
+        changed_word_count += max(len(removed), len(added))
+        if changed_word_count > MAX_WORD_DIFF_CHANGES:
+            return None
+
+        if tag == "replace":
+            parts.append(f"{' '.join(removed)}->{' '.join(added)}")
+        elif tag == "delete":
+            parts.append(f"-{' '.join(removed)}")
+        elif tag == "insert":
+            parts.append(f"+{' '.join(added)}")
+
+    if not parts:
+        return None
+    return " ; ".join(parts)
 
 # External Logging 
 def loggingFromExternal(type: str, message: str):
@@ -113,6 +164,18 @@ def loggingFromExternal(type: str, message: str):
 
 # The Magic
 class DiscordBot(commands.Bot):
+    async def _get_audit_actor(self, guild: discord.Guild, action: discord.AuditLogAction, target_id: int):
+        try:
+            if not guild.me or not guild.me.guild_permissions.view_audit_log:
+                return None
+            async for entry in guild.audit_logs(limit=10, action=action):
+                target = getattr(entry, "target", None)
+                if getattr(target, "id", None) == target_id:
+                    return entry.user
+        except Exception:
+            return None
+        return None
+
     async def on_ready(self):
         print(f'We have logged in as {self.user} | ID: {self.user.id}')
         startup_time_start = time.time()
@@ -138,7 +201,7 @@ class DiscordBot(commands.Bot):
         startup_time = round((startup_time_finish - startup_time_start)*1000,2)
         logger.info(f"Bot startup successfully | Startup-Time: {startup_time} Milliseconds.")
         if main_statusChannel != 0 and not maintenance:
-            return await DiscordBot.send_status(self,"**Bot Online**",f"Startup-Time: {startup_time} Milliseconds.")
+            return #await DiscordBot.send_status(self,"**Bot Online**",f"Startup-Time: {startup_time} Milliseconds.")
 
     async def on_message(self,message):
         if message.author == self.user:
@@ -158,7 +221,7 @@ class DiscordBot(commands.Bot):
         return
 
     async def on_guild_join(self,guild):
-        self.wait_until_ready()
+        await self.wait_until_ready()
         logger.info(f"~~~Start Syncing new Guild: [{guild.name}] ...~~~")
         try:
             await self.tree.sync(guild=discord.Object(id=guild.id))
@@ -182,106 +245,219 @@ class DiscordBot(commands.Bot):
     async def send_logs(self, guild_id: int, title: str, log: str):
         guild = self.get_guild(guild_id)
         guild_config = db.get_guild_config(guild_id)
-        channel = guild.get_channel(guild_config["logChannel"])
+        channel = guild.get_channel(guild_config["logChannel"]) if guild else None
         embed = get_embed(title, log)
-        embed.set_author(name=guild.name, icon_url=guild.icon)
-        
+        embed.set_author(name=guild.name if guild else str(guild_id), icon_url=(guild.icon if guild else None))
+
         if not guild_config["onlyForwarding"]:
-            await channel.send(embed=embed)
-            
+            if channel is None:
+                logger.warning(
+                    f"send_logs | guild={guild_id} ({guild.name if guild else 'Unknown'}) | logChannel not found: {guild_config['logChannel']}"
+                )
+            else:
+                try:
+                    await channel.send(embed=embed)
+                except discord.Forbidden as e:
+                    logger.warning(
+                        f"send_logs | guild={guild_id} ({guild.name if guild else 'Unknown'}) | Missing Access to send in channel={channel.id}: {e}"
+                    )
+                except discord.HTTPException as e:
+                    logger.warning(
+                        f"send_logs | guild={guild_id} ({guild.name if guild else 'Unknown'}) | HTTPException sending log: {e}"
+                    )
+
         for forwarding_guild in guild_config["logSendingToServerId"]:
-            await self.forwarding_embeds(forwarding_guild, embed, guild_id)
+            try:
+                await self.forwarding_embeds(forwarding_guild, embed, guild_id)
+            except discord.Forbidden as e:
+                to_guild = self.get_guild(forwarding_guild)
+                logger.warning(
+                    f"send_logs | from_guild={guild_id} ({guild.name if guild else 'Unknown'}) -> to_guild={forwarding_guild} ({to_guild.name if to_guild else 'Unknown'}) | Missing Access: {e}"
+                )
+            except discord.HTTPException as e:
+                to_guild = self.get_guild(forwarding_guild)
+                logger.warning(
+                    f"send_logs | from_guild={guild_id} ({guild.name if guild else 'Unknown'}) -> to_guild={forwarding_guild} ({to_guild.name if to_guild else 'Unknown'}) | HTTPException: {e}"
+                )
+            except Exception as e:
+                to_guild = self.get_guild(forwarding_guild)
+                logger.warning(
+                    f"send_logs | from_guild={guild_id} ({guild.name if guild else 'Unknown'}) -> to_guild={forwarding_guild} ({to_guild.name if to_guild else 'Unknown'}) | Unexpected error: {e}"
+                )
         return
 
     async def forwarding_embeds(self, guild_id: int, embed: discord.Embed, from_guild_id: int):
         if not db.check_if_guild_exists(guild_id):
             return
-            
+
         guild = self.get_guild(guild_id)
         from_guild = self.get_guild(from_guild_id)
+        to_name = guild.name if guild else "Unknown"
+        from_name = from_guild.name if from_guild else "Unknown"
+
+        if guild is None or from_guild is None:
+            logger.warning(
+                f"forwarding_embeds | guild not found. to={guild_id} ({to_name}) from={from_guild_id} ({from_name})"
+            )
+            return
+
         guild_config = db.get_guild_config(guild_id)
         channel = guild.get_channel(guild_config["logChannel"])
+        if channel is None:
+            logger.warning(
+                f"forwarding_embeds | to_guild={guild_id} ({to_name}) | logChannel not found: {guild_config['logChannel']}"
+            )
+            return
+
         embed.set_author(name=from_guild.name, icon_url=from_guild.icon)
         embed.set_footer(text=f"From Server: {from_guild.name}")
-        return await channel.send(embed=embed)
+        try:
+            return await channel.send(embed=embed)
+        except discord.Forbidden as e:
+            logger.warning(
+                f"forwarding_embeds | to_guild={guild_id} ({to_name}) | Missing Access to send in channel={channel.id}: {e}"
+            )
+            return
+        except discord.HTTPException as e:
+            logger.warning(
+                f"forwarding_embeds | to_guild={guild_id} ({to_name}) | HTTPException: {e}"
+            )
+            return
 
     # Discord Event Logging
     async def on_raw_reaction_add(self, payload):
         if payload.user_id == self.user.id:
             return
-        
+
         guild_id = payload.guild_id
         if not db.check_if_guild_exists(guild_id):
             return
-        
+
         guild_config = db.get_guild_config(guild_id)
         if not guild_config["selfLogging"]:
             return
-            
+
         log_settings = db.get_log_settings(guild_id)
         if not log_settings["messageReactionAdd"]:
             return
 
         guild = self.get_guild(guild_id)
+        if guild is None:
+            return
+
         member = guild.get_member(payload.user_id)
+        member_str = f"{member} | {member.id}" if member else f"Unknown Member | {payload.user_id}"
+
         channel = guild.get_channel(payload.channel_id)
-        message = await channel.fetch_message(payload.message_id)
-        
+        channel_str = f"{channel.mention} | {channel.id}" if channel else f"Unknown Channel | {payload.channel_id}"
+
+        message_id = payload.message_id
+        try:
+            if channel is not None:
+                message = await channel.fetch_message(message_id)
+                message_id = message.id
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            # Not critical for logging; we can still log the IDs.
+            pass
+
         emoji = str(payload.emoji)
         if len(emoji) > 100:
             emoji = emoji[:97] + "..."
-        
-        log = f"**User:** {member} | {member.id}\n**Channel:** {channel.mention} | {channel.id}\n**Message ID:** {message.id}\n**Emoji:** {emoji}"
+
+        link = build_message_link(guild_id, payload.channel_id, message_id)
+        log = (
+            f"**User:** {member_str}\n"
+            f"**Channel:** {channel_str}\n"
+            f"**Message ID:** {message_id}\n"
+            f"**Emoji:** {emoji}\n"
+            f"**Link:** [Jump to Message]({link})"
+        )
         await self.send_logs(guild_id, "Reaction Added", log)
         return
-    
+
     async def on_raw_reaction_remove(self, payload):
         if payload.user_id == self.user.id:
             return
-        
+
         guild_id = payload.guild_id
         if not db.check_if_guild_exists(guild_id):
             return
-        
+
         guild_config = db.get_guild_config(guild_id)
         if not guild_config["selfLogging"]:
             return
-            
+
         log_settings = db.get_log_settings(guild_id)
         if not log_settings["messageReactionRemove"]:
             return
 
         guild = self.get_guild(guild_id)
+        if guild is None:
+            return
+
         member = guild.get_member(payload.user_id)
+        member_str = f"{member} | {member.id}" if member else f"Unknown Member | {payload.user_id}"
+
         channel = guild.get_channel(payload.channel_id)
-        message = await channel.fetch_message(payload.message_id)
-        
+        channel_str = f"{channel.mention} | {channel.id}" if channel else f"Unknown Channel | {payload.channel_id}"
+
+        message_id = payload.message_id
+        try:
+            if channel is not None:
+                message = await channel.fetch_message(message_id)
+                message_id = message.id
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            pass
+
         emoji = str(payload.emoji)
         if len(emoji) > 100:
             emoji = emoji[:97] + "..."
-        
-        log = f"**User:** {member} | {member.id}\n**Channel:** {channel.mention} | {channel.id}\n**Message ID:** {message.id}\n**Emoji:** {emoji}"
+
+        link = build_message_link(guild_id, payload.channel_id, message_id)
+        log = (
+            f"**User:** {member_str}\n"
+            f"**Channel:** {channel_str}\n"
+            f"**Message ID:** {message_id}\n"
+            f"**Emoji:** {emoji}\n"
+            f"**Link:** [Jump to Message]({link})"
+        )
         await self.send_logs(guild_id, "Reaction Removed", log)
         return
-    
+
     async def on_raw_reaction_clear(self, payload):
         guild_id = payload.guild_id
         if not db.check_if_guild_exists(guild_id):
             return
-        
+
         guild_config = db.get_guild_config(guild_id)
         if not guild_config["selfLogging"]:
             return
-            
+
         log_settings = db.get_log_settings(guild_id)
         if not log_settings["messageReactionClear"]:
             return
 
         guild = self.get_guild(guild_id)
+        if guild is None:
+            return
+
         channel = guild.get_channel(payload.channel_id)
-        message = await channel.fetch_message(payload.message_id)
-        
-        log = f"**Channel:** {channel.mention} | {channel.id}\n**Message ID:** {message.id}"
+        channel_str = f"{channel.mention} | {channel.id}" if channel else f"Unknown Channel | {payload.channel_id}"
+
+        message_id = payload.message_id
+        try:
+            if channel is not None:
+                message = await channel.fetch_message(message_id)
+                message_id = message.id
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            pass
+
+        link = build_message_link(guild_id, payload.channel_id, message_id)
+        log = (
+            f"**Channel:** {channel_str}\n"
+            f"**Message ID:** {message_id}\n"
+            f"**Link:** [Jump to Message]({link})"
+        )
         await self.send_logs(guild_id, "Reactions Cleared", log)
         return
     
@@ -316,8 +492,8 @@ class DiscordBot(commands.Bot):
             return
 
         guild = self.get_guild(guild_id)
-        
-        log = f"**User ID:** {payload.user.id}\n**Member Count:** {guild.member_count}"
+
+        log = f"**User ID:** {payload.user.id}\n**User Name:** {payload.user.name}\n**Member Count:** {guild.member_count}"
         await self.send_logs(guild_id, "Member Left", log)
         return
     
@@ -371,13 +547,33 @@ class DiscordBot(commands.Bot):
         changes = []
         if before.nick != after.nick:
             changes.append(f"**Nickname:** {before.nick} -> {after.nick}")
+
         if before.roles != after.roles:
-            before_roles = ', '.join([role.name for role in before.roles if role.name != "@everyone"])
-            after_roles = ', '.join([role.name for role in after.roles if role.name != "@everyone"])
-            changes.append(f"**Roles:** {before_roles} -> {after_roles}")
+            before_role_ids = {r.id for r in before.roles if r.name != "@everyone"}
+            after_role_ids = {r.id for r in after.roles if r.name != "@everyone"}
+
+            added_ids = after_role_ids - before_role_ids
+            removed_ids = before_role_ids - after_role_ids
+
+            added_roles = [r.mention for r in after.roles if r.id in added_ids]
+            removed_roles = [r.name for r in before.roles if r.id in removed_ids]
+
+            role_lines = []
+            if added_roles:
+                role_lines.append(f"**Roles Added:** {', '.join(added_roles)}")
+            if removed_roles:
+                role_lines.append(f"**Roles Removed:** {', '.join(removed_roles)}")
+
+            # Best-effort: who changed roles (audit log, requires View Audit Log)
+            actor = await self._get_audit_actor(after.guild, discord.AuditLogAction.member_role_update, after.id)
+            actor_str = f"{actor} | {actor.id}" if actor else "Unknown"
+
+            if role_lines:
+                changes.append("\n".join(role_lines) + f"\n**Changed By:** {actor_str}")
+
         if before.pending != after.pending:
             changes.append(f"**Membership Screening:** {before.pending} -> {after.pending}")
-        
+
         if before.avatar != after.avatar:
             before_avatar = before.avatar.url if before.avatar else "No Avatar"
             after_avatar = after.avatar.url if after.avatar else "No Avatar"
@@ -402,10 +598,17 @@ class DiscordBot(commands.Bot):
             return
 
         channel = self.get_channel(payload.channel_id)
+        channel_str = f"{channel.mention} | {channel.id}" if channel else f"Unknown Channel | {payload.channel_id}"
         message_id = payload.message_id
         cached_message = payload.cached_message.content if payload.cached_message else "Content not cached"
-        
-        log = f"**Channel:** {channel.mention}\n**Message:** {cached_message}\n**Message ID:** {message_id}"
+
+        link = build_message_link(guild_id, payload.channel_id, message_id)
+        log = (
+            f"**Channel:** {channel_str}\n"
+            f"**Message:** {cached_message}\n"
+            f"**Message ID:** {message_id}\n"
+            f"**Link:** [Jump to Message]({link})"
+        )
         await self.send_logs(guild_id, "Message Delete", log)
         return
     
@@ -423,41 +626,78 @@ class DiscordBot(commands.Bot):
             return
 
         channel = self.get_channel(payload.channel_id)
+        channel_str = f"{channel.mention} | {channel.id}" if channel else f"Unknown Channel | {payload.channel_id}"
         message_ids = payload.message_ids
-        
-        log = f"**Channel:** {channel.mention} | {channel.id}\n**Message IDs:** {', '.join(map(str, message_ids))}"
+
+        MAX_LINKS = 15
+        links = [
+            f"[{mid}]({build_message_link(guild_id, payload.channel_id, mid)})"
+            for mid in list(message_ids)[:MAX_LINKS]
+        ]
+        links_str = ", ".join(links)
+        if len(message_ids) > MAX_LINKS:
+            links_str += f" (+{len(message_ids) - MAX_LINKS} more)"
+
+        log = (
+            f"**Channel:** {channel_str}\n"
+            f"**Message IDs:** {', '.join(map(str, message_ids))}\n"
+            f"**Links:** {links_str}"
+        )
         await self.send_logs(guild_id, "Bulk Message Delete", log)
         return
 
     async def on_raw_message_edit(self, payload):
         if payload.data.get("author", {}).get("id") == str(self.user.id):
             return
-        
+
+        # Discord only includes "content" when the text itself changed - edits
+        # that only touch embeds/pins/etc. send a partial payload without it.
+        if "content" not in payload.data:
+            return
+
         guild_id = payload.guild_id
         if not db.check_if_guild_exists(guild_id):
             return
-        
+
         guild_config = db.get_guild_config(guild_id)
         if not guild_config["selfLogging"]:
             return
-            
+
         log_settings = db.get_log_settings(guild_id)
         if not log_settings["messageUpdate"]:
             return
 
         guild = self.get_guild(guild_id)
+        if guild is None:
+            return
         channel = guild.get_channel(payload.channel_id)
-        
-        before_content = payload.cached_message.content if payload.cached_message else "Content not cached"
+        channel_str = f"{channel.mention} | {channel.id}" if channel else f"Unknown Channel | {payload.channel_id}"
+
+        before_content = payload.cached_message.content if payload.cached_message else None
         after_content = payload.data.get("content", "")
 
-        if before_content == after_content:
+        if before_content is not None and before_content == after_content:
             return
 
         author_id = payload.data.get("author", {}).get("id")
         author = guild.get_member(int(author_id)) if author_id else "Unknown User"
 
-        log = f"**User:** {author}\n**Channel:** {channel.mention}\n**Message ID:** {payload.message_id}\n**Before:** {before_content}\n**After:** {after_content}"
+        link = build_message_link(guild_id, payload.channel_id, payload.message_id)
+        content_diff = diff_message_content(before_content, after_content) if before_content is not None else None
+
+        if content_diff is not None:
+            content_lines = f"**Changed:** {content_diff}"
+        else:
+            before_display = before_content if before_content is not None else "Content not cached"
+            content_lines = f"**Before:** {before_display}\n**After:** {after_content}"
+
+        log = (
+            f"**User:** {author}\n"
+            f"**Channel:** {channel_str}\n"
+            f"**Message ID:** {payload.message_id}\n"
+            f"{content_lines}\n"
+            f"**Link:** [Jump to Message]({link})"
+        )
         await self.send_logs(guild_id, "Message Updated", log)
         return
     
@@ -489,6 +729,141 @@ class DiscordBot(commands.Bot):
                 log = f"**User:** {member.mention}\n**From Channel:** {before.channel.mention}\n**To Channel:** {after.channel.mention}"
                 await self.send_logs(guild_id, "Voice Channel Moved", log)
 
+    async def on_guild_channel_create(self, channel: discord.abc.GuildChannel):
+        guild_id = channel.guild.id
+        if not db.check_if_guild_exists(guild_id):
+            return
+
+        guild_config = db.get_guild_config(guild_id)
+        if not guild_config["selfLogging"]:
+            return
+
+        log_settings = db.get_log_settings(guild_id)
+        if not log_settings["channelCreate"]:
+            return
+
+        actor = await self._get_audit_actor(channel.guild, discord.AuditLogAction.channel_create, channel.id)
+        actor_str = f"{actor} | {actor.id}" if actor else "Unknown"
+
+        log = (
+            f"**Channel:** {channel.mention} | {channel.id}\n"
+            f"**Type:** {getattr(channel.type, 'name', str(channel.type))}\n"
+            f"**Category:** {channel.category.name if getattr(channel, 'category', None) else 'None'}\n"
+            f"**Created By:** {actor_str}"
+        )
+        await self.send_logs(guild_id, "Channel Created", log)
+        return
+
+    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
+        guild_id = channel.guild.id
+        if not db.check_if_guild_exists(guild_id):
+            return
+
+        guild_config = db.get_guild_config(guild_id)
+        if not guild_config["selfLogging"]:
+            return
+
+        log_settings = db.get_log_settings(guild_id)
+        if not log_settings["channelDelete"]:
+            return
+
+        actor = await self._get_audit_actor(channel.guild, discord.AuditLogAction.channel_delete, channel.id)
+        actor_str = f"{actor} | {actor.id}" if actor else "Unknown"
+
+        # channel.mention will not be valid for deleted channels; show name + id
+        log = (
+            f"**Channel:** #{channel.name} | {channel.id}\n"
+            f"**Type:** {getattr(channel.type, 'name', str(channel.type))}\n"
+            f"**Category:** {channel.category.name if getattr(channel, 'category', None) else 'None'}\n"
+            f"**Deleted By:** {actor_str}"
+        )
+        await self.send_logs(guild_id, "Channel Deleted", log)
+        return
+
+    async def on_guild_channel_update(self, before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
+        guild_id = after.guild.id
+        if not db.check_if_guild_exists(guild_id):
+            return
+
+        guild_config = db.get_guild_config(guild_id)
+        if not guild_config["selfLogging"]:
+            return
+
+        log_settings = db.get_log_settings(guild_id)
+        if not log_settings["channelUpdate"]:
+            return
+
+        changes = []
+
+        if before.name != after.name:
+            changes.append(f"**Name:** {before.name} -> {after.name}")
+
+        before_category = before.category.name if getattr(before, 'category', None) else None
+        after_category = after.category.name if getattr(after, 'category', None) else None
+        if before_category != after_category:
+            changes.append(f"**Category:** {before_category or 'None'} -> {after_category or 'None'}")
+
+        before_pos = getattr(before, 'position', None)
+        after_pos = getattr(after, 'position', None)
+        if before_pos != after_pos:
+            changes.append(f"**Position:** {before_pos} -> {after_pos}")
+
+        before_nsfw = getattr(before, 'nsfw', None)
+        after_nsfw = getattr(after, 'nsfw', None)
+        if before_nsfw != after_nsfw:
+            changes.append(f"**NSFW:** {before_nsfw} -> {after_nsfw}")
+
+        # Text channel specific fields
+        before_topic = getattr(before, 'topic', None)
+        after_topic = getattr(after, 'topic', None)
+        if before_topic != after_topic:
+            changes.append(f"**Topic:** {before_topic or 'None'} -> {after_topic or 'None'}")
+
+        before_slowmode = getattr(before, 'slowmode_delay', None)
+        after_slowmode = getattr(after, 'slowmode_delay', None)
+        if before_slowmode != after_slowmode:
+            changes.append(f"**Slowmode:** {before_slowmode} -> {after_slowmode}")
+
+        if not changes:
+            return
+
+        actor = await self._get_audit_actor(after.guild, discord.AuditLogAction.channel_update, after.id)
+        actor_str = f"{actor} | {actor.id}" if actor else "Unknown"
+
+        mention = getattr(after, 'mention', f"#{after.name}")
+        log = (
+            f"**Channel:** {mention} | {after.id}\n"
+            + "\n".join(changes)
+            + f"\n**Edited By:** {actor_str}"
+        )
+        await self.send_logs(guild_id, "Channel Updated", log)
+        return
+
+    async def on_guild_channel_pins_update(self, channel: discord.abc.GuildChannel, last_pin: datetime.datetime | None):
+        guild_id = channel.guild.id
+        if not db.check_if_guild_exists(guild_id):
+            return
+
+        guild_config = db.get_guild_config(guild_id)
+        if not guild_config["selfLogging"]:
+            return
+
+        log_settings = db.get_log_settings(guild_id)
+        if not log_settings.get("messageUpdate", False):
+            return
+
+        actor = await self._get_audit_actor(channel.guild, discord.AuditLogAction.message_pin, channel.id)
+        actor_str = f"{actor} | {actor.id}" if actor else "Unknown"
+
+        last_pin_str = last_pin.strftime('%d.%m.%Y %H:%M:%S') if last_pin else "None"
+        log = (
+            f"**Channel:** {channel.mention} | {channel.id}\n"
+            f"**Last Pin:** {last_pin_str}\n"
+            f"**By:** {actor_str}"
+        )
+        await self.send_logs(guild_id, "Channel Pins Updated", log)
+        return
+
 # Automation Tasks
 def loops(client):
     @loop(hours=24)
@@ -501,6 +876,34 @@ def loops(client):
     async def clear_old_logs():
         clean_old_logs(LOG_DIR,BASE_LOG_NAME,RETENTION_DAYS)
         logger.info(f"Checked for Old Logs - {datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%d.%m.%Y | %H:%M:%S')}")
+
+    @loop(seconds=60)
+    async def uptime_heartbeat():
+        if not os.path.exists("heartbeat.py"):
+            return
+        global heartbeat_instance
+        if heartbeat_instance is None:
+            try:
+                heartbeat_instance = Heartbeat(client, port=HEALTH_CHECK_PORT)
+                await heartbeat_instance.start()
+                logger.info("Heartbeat Server initialisiert und gestartet")
+            except Exception as e:
+                logger.error(f"Fehler beim Starten des Heartbeat Servers: {e}")
+                return
+        try:
+            if not client.is_ready():
+                logger.warning("Bot ist nicht bereit")
+            else:
+                logger.debug(f"Heartbeat aktiv - Bot läuft mit {len(client.guilds)} Servern")
+        except Exception as e:
+            logger.error(f"Fehler im Heartbeat Loop: {e}")
+
+    uptime_heartbeat.start()
+    
+    @uptime_heartbeat.before_loop
+    async def before_heartbeat():
+        await client.wait_until_ready()
+
 
     check_service.start()
     clear_old_logs.start()
