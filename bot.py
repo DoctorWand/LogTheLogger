@@ -600,16 +600,30 @@ class DiscordBot(commands.Bot):
         channel = self.get_channel(payload.channel_id)
         channel_str = f"{channel.mention} | {channel.id}" if channel else f"Unknown Channel | {payload.channel_id}"
         message_id = payload.message_id
+        author = payload.cached_message.author if payload.cached_message else None
+        author_str = f"{author} | {author.id}" if author else "Unknown"
         cached_message = payload.cached_message.content if payload.cached_message else "Content not cached"
 
+        deleter = None
+        guild = self.get_guild(guild_id)
+        if guild is not None and author is not None:
+            deleter = await self._get_audit_actor(guild, discord.AuditLogAction.message_delete, author.id)
+
         link = build_message_link(guild_id, payload.channel_id, message_id)
-        log = (
-            f"**Channel:** {channel_str}\n"
-            f"**Message:** {cached_message}\n"
-            f"**Message ID:** {message_id}\n"
-            f"**Link:** [Jump to Message]({link})"
-        )
-        await self.send_logs(guild_id, "Message Delete", log)
+        lines = [
+            f"**Channel:** {channel_str}",
+            f"**Author:** {author_str}",
+        ]
+        # Skip the separate line when the author deleted their own message - same ID twice is noise.
+        if not (author is not None and deleter is not None and deleter.id == author.id):
+            deleted_by_str = f"{deleter} | {deleter.id}" if deleter else "Unknown"
+            lines.append(f"**Deleted By:** {deleted_by_str}")
+        lines += [
+            f"**Message:** {cached_message}",
+            f"**Message ID:** {message_id}",
+            f"**Link:** [Jump to Message]({link})",
+        ]
+        await self.send_logs(guild_id, "Message Delete", "\n".join(lines))
         return
     
     async def on_raw_bulk_message_delete(self, payload):
