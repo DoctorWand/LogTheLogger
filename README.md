@@ -42,7 +42,7 @@ The SQLite database is stored in `./data/ltl_database.db` and survives updates a
 1. Install [Python 3.13](https://www.python.org/downloads/) or later
 2. `cp .env.example .env` and fill in `DISCORD_TOKEN`
 3. `python -m pip install -r requirements.txt`
-4. `python main.py` (on Windows you can use `start.bat`)
+4. `python main.py`
 
 ### Migrating from 2.0 (default_config.json)
 `default_config.json` is no longer read. Move its values into `.env`:
