@@ -30,14 +30,21 @@ All configuration lives in a `.env` file. Copy `.env.example` to `.env` and set 
 Every option is explained in `.env.example`.
 
 ### With Docker (recommended, e.g. on an Ubuntu server)
-1. Install Docker with the compose plugin
-2. Clone this repository and create the config: `cp .env.example .env`, then fill in `DISCORD_TOKEN`
-3. Create the data folder as your own user (the container runs as uid 1000): `mkdir data`
-4. Start the bot: `docker compose up -d --build`
-5. Follow the logs: `docker compose logs -f`
+A ready-made image is published to `ghcr.io/doctorwand/logthelogger:latest` on every change to `main`.
+You only need two files on the server: `docker-compose.yml` and `.env`.
 
-Updating: `git pull && docker compose up -d --build`.
+1. Install Docker with the compose plugin
+2. Copy `docker-compose.yml` and `.env.example` into a folder (for Dockge: the stack folder, e.g. `/opt/stacks/logthelogger`)
+3. Rename `.env.example` to `.env` and fill in `DISCORD_TOKEN`
+4. Create the data folder as your own user (the container runs as uid 1000): `mkdir data`
+5. Start the bot: `docker compose up -d` (or "Start" in Dockge)
+6. Follow the logs: `docker compose logs -f`
+
+Updating: `docker compose pull && docker compose up -d`, or "Update" in Dockge.
 The SQLite database is stored in `./data/ltl_database.db` and survives updates and restarts.
+
+To build the image from a local checkout instead (for development):
+`docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build`
 
 ### Without Docker
 1. Install [Python 3.13](https://www.python.org/downloads/) or later

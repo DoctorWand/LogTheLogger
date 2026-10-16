@@ -1,7 +1,9 @@
 services:
   bot:
-    build: .
-    image: logthelogger:latest
+    # Published by .github/workflows/docker-image.yml on every push to main.
+    # For a locally built image use docker-compose.dev.yml (see README).
+    image: ghcr.io/doctorwand/logthelogger:latest
+    pull_policy: always
     container_name: logthelogger
     restart: unless-stopped
     env_file: .env
