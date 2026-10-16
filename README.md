@@ -89,7 +89,7 @@ Feel free to contribute to this project by:
 ## Use of AI
 Parts of this project are developed with AI assistance (Claude by Anthropic, via Claude Code).
 
-- **Up to version 2.0:** written by DoctorWand.
+- **Up to version 2.0:** written by DoctorWand, with occasional AI help for minor bug fixes.
 - **From version 2.1 (October 2026):** the restructuring was planned and largely written by Claude. That covers the `.env` configuration, the Docker setup, the startup bug fixes and the forwarding consent. DoctorWand set the direction, reviewed the changes and decided what gets merged.
 
 Commits written with AI carry a `Co-Authored-By: Claude` line, so `git log` shows exactly which changes were AI-assisted.
