@@ -207,8 +207,9 @@ class DiscordBot(commands.Bot):
             return
 
         if message.channel.id == guild_config["logChannel"]:
+            forwarding_targets = db.get_forwarding_targets(guild_id)
             for embed in message.embeds:
-                for forward_guild in guild_config["logSendingToServerId"]:
+                for forward_guild in forwarding_targets:
                     await self.forwarding_embeds(forward_guild, embed, message.guild.id)
         return
 
@@ -232,6 +233,25 @@ class DiscordBot(commands.Bot):
             return
         embed = get_embed(status,info)
         return await channel.send(embed=embed)
+
+    # Sends a notice to a guild's own log channel only, never forwarded
+    async def notify_log_channel(self, guild_id: int, title: str, text: str) -> bool:
+        guild = self.get_guild(guild_id)
+        guild_config = db.get_guild_config(guild_id)
+        if guild is None or guild_config is None:
+            return False
+        channel = guild.get_channel(guild_config["logChannel"])
+        if channel is None:
+            logger.warning(f"notify_log_channel | guild={guild_id} ({guild.name}) | logChannel not found: {guild_config['logChannel']}")
+            return False
+        embed = get_embed(title, text)
+        embed.set_author(name=self.user.display_name, icon_url=self.user.display_avatar)
+        try:
+            await channel.send(embed=embed)
+            return True
+        except discord.HTTPException as e:
+            logger.warning(f"notify_log_channel | guild={guild_id} ({guild.name}) | could not send: {e}")
+            return False
 
     async def send_logs(self, guild_id: int, title: str, log: str):
         guild = self.get_guild(guild_id)
@@ -257,7 +277,7 @@ class DiscordBot(commands.Bot):
                         f"send_logs | guild={guild_id} ({guild.name if guild else 'Unknown'}) | HTTPException sending log: {e}"
                     )
 
-        for forwarding_guild in guild_config["logSendingToServerId"]:
+        for forwarding_guild in db.get_forwarding_targets(guild_id):
             try:
                 await self.forwarding_embeds(forwarding_guild, embed, guild_id)
             except discord.Forbidden as e:
@@ -951,7 +971,10 @@ def bot_commands(client):
         await client.send_logs(guild_id, "Forwarding", f"was set to {forwarding}")
         return await interaction.response.send_message(content=f"Forwarding Statement is now: {forwarding}")
 
-    @client.tree.command(name="forwarding-server",description="The Server you want to get it forwarded")
+    # Forwarding needs the target's consent: Server A sends a request with
+    # /forwarding-server, Server B accepts it with /forwarding-accept.
+    @client.tree.command(name="forwarding-server",description="Request to forward your logs to another server")
+    @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_webhooks=True)
     async def forwardingServer(interaction: discord.Interaction, server_id: str):
         if not server_id.isdigit():
@@ -972,21 +995,94 @@ def bot_commands(client):
         target_guild = client.get_guild(server_id_int)
         if target_guild is None:
             return await interaction.response.send_message(content="The bot is not on the other server anymore", ephemeral=True)
-            
-        guild_config = db.get_guild_config(guild_id)
-        current_list = guild_config["logSendingToServerId"]
-        
-        if server_id_int in current_list:
+
+        status = db.get_forwarding_link(guild_id, server_id_int)
+        if status == "approved":
             return await interaction.response.send_message(content="Server is already in forwarding list")
-            
-        current_list.append(server_id_int)
-        db.update_guild_config(guild_id, logSendingToServerId=current_list)
-        
-        logger.info(f"Added Forwarding Server {server_id_int} for {interaction.guild.name} | {guild_id}")
-        await interaction.response.send_message(content=f"The Server {target_guild.name} | {server_id_int} was added successfully")
-        await client.send_logs(guild_id, "Forwarding-Server", f"{target_guild.name} was added to the forwarding list")
-    
+        if status == "pending":
+            return await interaction.response.send_message(content=f"A request to {target_guild.name} is already pending. An admin there has to run `/forwarding-accept {guild_id}`", ephemeral=True)
+
+        db.set_forwarding_link(guild_id, server_id_int, "pending")
+        logger.info(f"Forwarding request {interaction.guild.name} | {guild_id} -> {target_guild.name} | {server_id_int}")
+
+        await interaction.response.send_message(content=f"Request sent to {target_guild.name} | {server_id_int}. Logs are forwarded once an admin there accepts it.")
+        notified = await client.notify_log_channel(server_id_int, "Forwarding Request",
+            f"**{interaction.guild.name}** | {guild_id} wants to forward its logs to this server.\n"
+            f"Requested by: {interaction.user} | {interaction.user.id}\n\n"
+            f"Accept: `/forwarding-accept {guild_id}`\n"
+            f"Deny: `/forwarding-deny {guild_id}`")
+        if not notified:
+            await interaction.followup.send(content="The other server's log channel couldn't be reached, so they won't see the request there. An admin there can still find it with `/forwarding-list` and accept it.", ephemeral=True)
+        await client.send_logs(guild_id, "Forwarding-Server", f"Forwarding to {target_guild.name} was requested")
+
+    @client.tree.command(name="forwarding-accept",description="Accept logs being forwarded from another server")
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(manage_webhooks=True)
+    async def forwardingAccept(interaction: discord.Interaction, server_id: str):
+        if not server_id.isdigit():
+            return await interaction.response.send_message(content="Please enter a server id and not a server name")
+
+        source_id = int(server_id)
+        guild_id = interaction.guild.id
+
+        status = db.get_forwarding_link(source_id, guild_id)
+        if status is None:
+            return await interaction.response.send_message(content="There is no forwarding request from this server", ephemeral=True)
+        if status == "approved":
+            return await interaction.response.send_message(content="Logs from this server are already forwarded here", ephemeral=True)
+
+        db.set_forwarding_link(source_id, guild_id, "approved")
+        source_guild = client.get_guild(source_id)
+        source_name = source_guild.name if source_guild else "Unknown Server"
+        logger.info(f"Forwarding accepted {source_name} | {source_id} -> {interaction.guild.name} | {guild_id}")
+
+        await interaction.response.send_message(content=f"Logs from {source_name} | {source_id} are now forwarded here")
+        await client.notify_log_channel(source_id, "Forwarding Accepted", f"**{interaction.guild.name}** | {guild_id} accepted your forwarding request. Logs are forwarded from now on.")
+
+    @client.tree.command(name="forwarding-deny",description="Deny or stop logs being forwarded from another server")
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(manage_webhooks=True)
+    async def forwardingDeny(interaction: discord.Interaction, server_id: str):
+        if not server_id.isdigit():
+            return await interaction.response.send_message(content="Please enter a server id and not a server name")
+
+        source_id = int(server_id)
+        guild_id = interaction.guild.id
+
+        if not db.remove_forwarding_link(source_id, guild_id):
+            return await interaction.response.send_message(content="There is no forwarding request or link from this server", ephemeral=True)
+
+        source_guild = client.get_guild(source_id)
+        source_name = source_guild.name if source_guild else "Unknown Server"
+        logger.info(f"Forwarding denied/removed {source_name} | {source_id} -> {interaction.guild.name} | {guild_id}")
+
+        await interaction.response.send_message(content=f"Logs from {source_name} | {source_id} are no longer forwarded here")
+        await client.notify_log_channel(source_id, "Forwarding Stopped", f"**{interaction.guild.name}** | {guild_id} denied or stopped forwarding from your server.")
+
+    @client.tree.command(name="forwarding-list",description="Show which servers you forward to and which forward to you")
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(manage_webhooks=True)
+    async def forwardingList(interaction: discord.Interaction):
+        links = db.list_forwarding_links(interaction.guild.id)
+
+        def describe(entries):
+            if not entries:
+                return "None"
+            lines = []
+            for other_id, status in entries:
+                other_guild = client.get_guild(other_id)
+                name = other_guild.name if other_guild else "Unknown Server"
+                lines.append(f"{name} | {other_id} | {status}")
+            return "\n".join(lines)
+
+        embed = get_embed("Forwarding",
+            f"**Your logs are forwarded to:**\n{describe(links['outgoing'])}\n\n"
+            f"**Logs forwarded to you from:**\n{describe(links['incoming'])}\n\n"
+            "Pending requests to you can be accepted with `/forwarding-accept <server id>`.")
+        return await interaction.response.send_message(embed=embed, ephemeral=True)
+
     @client.tree.command(name="delete-forwarding-server",description="Deletes a Server from the forwarding list")
+    @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_webhooks=True)
     async def deleteForwardingServer(interaction: discord.Interaction, server_id: str):
         if not server_id.isdigit():
@@ -998,14 +1094,8 @@ def bot_commands(client):
         if not db.check_if_guild_exists(guild_id):
             return await interaction.response.send_message(content="The /setup command wasn't executed yet!")
 
-        guild_config = db.get_guild_config(guild_id)
-        current_list = guild_config["logSendingToServerId"]
-        
-        if server_id_int not in current_list:
+        if not db.remove_forwarding_link(guild_id, server_id_int):
             return await interaction.response.send_message(content="The server-id you provided is not in the database for your server")
-            
-        current_list.remove(server_id_int)
-        db.update_guild_config(guild_id, logSendingToServerId=current_list)
         
         target_guild = client.get_guild(server_id_int)
         target_name = target_guild.name if target_guild else "Unknown Server"
@@ -1033,7 +1123,9 @@ def bot_commands(client):
             "1. On both Server execute the 'ltl_setup' command and enter your log channel\n"
             "2. For Server A execute the 'forwarding-server' command and enter Server Bs ID\n"
             "a. You will find the ID by right clicking Server B and then click on 'copy Server-ID'\n"
-            "b. If you can't see the 'copy Server-ID' then you have to activate developer mode under your settings\n\n"
+            "b. If you can't see the 'copy Server-ID' then you have to activate developer mode under your settings\n"
+            "3. On Server B execute the 'forwarding-accept' command with Server As ID\n"
+            "4. 'forwarding-list' shows all links, 'forwarding-deny' stops logs coming from a server\n\n"
             "**Which Permission do I need?**\n"
             "For most of the Commands you need the 'Managed Webhooks' permission")
         return await interaction.response.send_message(embed=embed)

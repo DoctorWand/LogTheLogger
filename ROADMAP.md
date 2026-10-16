@@ -37,6 +37,7 @@ Logging -
 - [ ] Cross-platform update system with backup creation
 - [x] Automated log cleanup with retention policies
 - [x] Multi-server forwarding support
+- [x] Forwarding only after the target server accepts the request
 
 ## Version 3.0 🚧 IN PLANNING
 ### Integrated Features
