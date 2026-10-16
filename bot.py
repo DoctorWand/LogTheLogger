@@ -664,6 +664,14 @@ class DiscordBot(commands.Bot):
         if payload.data.get("author", {}).get("id") == str(self.user.id):
             return
 
+        # Discord also fires this event when a message's embed refreshes/unfurls
+        # with no text edit (e.g. our own "Jump to Message" links re-unfurling
+        # days later) - that payload can still carry "content" (unchanged/empty)
+        # and often omits "author" entirely, so neither is reliable on its own.
+        # "edited_timestamp" is only ever set by Discord on a genuine text edit.
+        if not payload.data.get("edited_timestamp"):
+            return
+
         # Discord only includes "content" when the text itself changed - edits
         # that only touch embeds/pins/etc. send a partial payload without it.
         if "content" not in payload.data:
