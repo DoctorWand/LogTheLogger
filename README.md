@@ -19,10 +19,11 @@ Currently on Version 2.1 with comprehensive self-logging and database features
 ## How to setup
 1. Invite the Bot on both servers
 2. Execute on both servers the `/ltl_setup` command and enter your log channels
-3. On the main server execute the `/forwarding-server` command and enter the second server id
-    1. With executing this command you should start seeing the logs from server A on server B
-4. Use `/self-logging true` to enable the bot's own event logging
-5. Configure specific log types using the database settings
+3. On server A execute the `/forwarding-server` command and enter server B's id
+    1. This sends a forwarding request to server B's log channel
+4. On server B execute `/forwarding-accept` with server A's id
+    1. From now on the logs from server A show up on server B
+5. Use `/self-logging true` to enable the bot's own event logging
 
 ## Running your own instance
 All configuration lives in a `.env` file. Copy `.env.example` to `.env` and set at least `DISCORD_TOKEN`.
@@ -63,8 +64,11 @@ Logs now go to the console; set `LOG_TO_FILE=true` to also write daily log files
 - `/ltl_setup` - Initial bot setup with log channel configuration
 - `/ltl_revoke_setup` - Remove bot configuration from server
 - `/forwarding <true/false>` - Enable/disable log forwarding
-- `/forwarding-server <server_id>` - Add server to forwarding list
-- `/delete-forwarding-server <server_id>` - Remove server from forwarding list
+- `/forwarding-server <server_id>` - Request to forward your logs to another server
+- `/forwarding-accept <server_id>` - Accept a forwarding request from another server
+- `/forwarding-deny <server_id>` - Deny a request or stop logs coming from another server
+- `/forwarding-list` - Show outgoing and incoming forwarding links and their status
+- `/delete-forwarding-server <server_id>` - Stop forwarding your logs to a server
 - `/self-logging <true/false>` - Enable/disable self event logging
 - `/info` - Display bot information
 - `/ltl-help` - Show detailed help information
@@ -81,6 +85,15 @@ Feel free to contribute to this project by:
 - Suggesting new features
 - Submitting pull requests
 - Improving documentation
+
+## Use of AI
+Parts of this project are developed with AI assistance (Claude by Anthropic, via Claude Code).
+
+- **Up to version 2.0:** written by DoctorWand.
+- **From version 2.1 (October 2026):** the restructuring was planned and largely written by Claude. That covers the `.env` configuration, the Docker setup, the startup bug fixes and the forwarding consent. DoctorWand set the direction, reviewed the changes and decided what gets merged.
+
+Commits written with AI carry a `Co-Authored-By: Claude` line, so `git log` shows exactly which changes were AI-assisted.
+Nothing gets merged without a human review. Bugs are still the maintainer's responsibility, so please report them like any other issue.
 
 ## License
 This project is open source. See the repository for license details.
