@@ -1,11 +1,11 @@
 # Imports
 import discord
-import json
 import time
 import datetime
 import difflib
 import os
 import re
+import sys
 import logging
 import pytz
 
@@ -14,41 +14,46 @@ from discord import app_commands
 from discord.ext import commands
 from discord.ext.tasks import loop
 from logging.handlers import TimedRotatingFileHandler
+import config
 from db_handler import db
 try:
     from heartbeat import Heartbeat
 except ImportError:
     Heartbeat = None
 
-# Setup file logging
-if not os.path.exists("F:/DiscordBotsData/LogTheLogger/Logs"):
-    LOG_DIR = "Logs"
-else:
-    LOG_DIR = "F:/DiscordBotsData/LogTheLogger/Logs"
+# Setup logging - always to stdout (Docker / process manager picks it up),
+# optionally also to daily rotating files when LOG_TO_FILE is enabled
+LOG_DIR = config.LOG_DIR
 BASE_LOG_NAME = "JASTBI-LogTheLogger"
-RETENTION_DAYS = 8
-TIMEZONE = "Europe/Berlin"
+RETENTION_DAYS = config.LOG_RETENTION_DAYS
+TIMEZONE = config.TIMEZONE
 
-os.makedirs(LOG_DIR,exist_ok=True)
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(config.LOG_LEVEL)
 if not logger.hasHandlers():
-    # backupCount=0 disables the handler's own (system-local-time-based) deletion.
-    # clean_old_logs() is the single source of truth for retention, using TIMEZONE
-    # explicitly - two independent cleanup schedules previously caused stale files
-    # to stick around or vanish at the wrong time depending on the host's system clock.
-    handler = TimedRotatingFileHandler(
-        filename=os.path.join(LOG_DIR,BASE_LOG_NAME),
-        when="midnight",
-        interval=1,
-        backupCount=0,
-        encoding="utf-8",
-        utc=False
-    )
-    handler.suffix = "%d.%m.%Y.log"
     formatter = logging.Formatter(datefmt='%d.%m.%Y %H:%M:%S',fmt='%(asctime)s.%(msecs)03d - %(levelname)s - %(message)s')
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    if config.LOG_TO_FILE:
+        os.makedirs(LOG_DIR,exist_ok=True)
+        # backupCount=0 disables the handler's own (system-local-time-based) deletion.
+        # clean_old_logs() is the single source of truth for retention, using TIMEZONE
+        # explicitly - two independent cleanup schedules previously caused stale files
+        # to stick around or vanish at the wrong time depending on the host's system clock.
+        file_handler = TimedRotatingFileHandler(
+            filename=os.path.join(LOG_DIR,BASE_LOG_NAME),
+            when="midnight",
+            interval=1,
+            backupCount=0,
+            encoding="utf-8",
+            utc=False
+        )
+        file_handler.suffix = "%d.%m.%Y.log"
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
 
 # Clear Old Logs
 def clean_old_logs(directory, base_name, retention_days, timezone=TIMEZONE):
@@ -66,46 +71,26 @@ def clean_old_logs(directory, base_name, retention_days, timezone=TIMEZONE):
                     full_path = os.path.join(directory,filename)
                     os.remove(full_path)
                     
-                    print(f"Deleted old log: {full_path}")
                     logger.info(f"Deleted old log: {full_path}")
                     logs_deleted = True
             except Exception as e:
-                print(f"Error - Log {filename} couldn't be deleted, Error: {e}")
                 logger.warning(f"Error - Log {filename} couldn't be deleted, Error: {e}")
                 raise e
     
     if not logs_deleted:
-        print(f"No old logs found - {datetime.datetime.now()}")
         logger.info("No old logs found")
 
-global main_server
-global main_statusChannel
-global token
+# Runtime config
+main_server = config.DISCORD_SERVER
+main_statusChannel = config.DISCORD_STATUS_CHANNEL
+bot_owner = config.BOT_OWNER
+# Runtime only: toggled by /maintenance, reset to MAINTENANCE_MODE on restart
+maintenance = config.MAINTENANCE_MODE
 
-# Initial load of configs
-with open("default_config.json",encoding="utf-8") as dc:
-    defaultConfig = json.load(dc)
+# Embed descriptions are capped by Discord at 4096 characters
+MAX_EMBED_DESCRIPTION = 4096
 
-if os.path.exists("E:/BotExtentions/LogTheLogger/ltl-bot.json"):
-    with open("E:/BotExtentions/LogTheLogger/ltl-bot.json", encoding="utf-8") as beltl:
-        extentionConfig = json.load(beltl)
-    
-    main_server = extentionConfig["discordDevServer"]
-    main_statusChannel = extentionConfig["discordBotStatus"]
-    token = extentionConfig["discordToken"]
-    bot_owner = extentionConfig["botOwner"]
-    maintenance = extentionConfig["maintenanceMode"]
-else:
-    main_server = defaultConfig["discordServer"]
-    main_statusChannel = defaultConfig["discordStatusChannel"]
-    token = defaultConfig["discordToken"]
-    bot_owner = defaultConfig["botOwner"]
-    maintenance = defaultConfig["maintenanceMode"]
-
-if Heartbeat is not None:
-    # Heartbeat/HealthCheck Server
-    HEALTH_CHECK_PORT = 8000
-    heartbeat_instance: Heartbeat | None = None
+heartbeat_instance = None
 
 # Getting base embed
 def get_embed(title:str,description:str) -> discord.Embed:
@@ -113,6 +98,8 @@ def get_embed(title:str,description:str) -> discord.Embed:
     # so Discord assumes UTC on display - on a host not running in UTC this silently
     # shifted every logged timestamp by the host's offset (occasionally showing as
     # a log from hours in the past/future).
+    if description and len(description) > MAX_EMBED_DESCRIPTION:
+        description = description[:MAX_EMBED_DESCRIPTION - 3] + "..."
     embed = discord.Embed(title=title,description=description,timestamp=datetime.datetime.now(datetime.timezone.utc))
     return embed
 
@@ -164,6 +151,8 @@ def loggingFromExternal(type: str, message: str):
 
 # The Magic
 class DiscordBot(commands.Bot):
+    startup_time: float = 0.0
+
     async def _get_audit_actor(self, guild: discord.Guild, action: discord.AuditLogAction, target_id: int):
         try:
             if not guild.me or not guild.me.guild_permissions.view_audit_log:
@@ -176,35 +165,38 @@ class DiscordBot(commands.Bot):
             return None
         return None
 
-    async def on_ready(self):
-        print(f'We have logged in as {self.user} | ID: {self.user.id}')
+    # setup_hook runs exactly once before connecting; on_ready fires again on every
+    # reconnect, which previously re-registered commands (CommandAlreadyRegistered)
+    # and re-started already running loops (RuntimeError).
+    async def setup_hook(self):
         startup_time_start = time.time()
         try:
             bot_commands(self)
         except Exception as e:
             logger.error(f"Setup Command Error: {e}")
             raise e
-        logging.info("~Start Syncing Guilds~")
-        for guild in self.guilds:
-            if guild.id == 846869213732929536:
-                self.tree.copy_global_to(guild=discord.Object(id=846869213732929536))
-                await self.tree.sync(guild=discord.Object(id=846869213732929536))
+        logger.info("~Start Syncing Commands~")
         try:
+            if config.DEV_GUILD_ID:
+                dev_guild = discord.Object(id=config.DEV_GUILD_ID)
+                self.tree.copy_global_to(guild=dev_guild)
+                await self.tree.sync(guild=dev_guild)
+            if main_server and main_server != config.DEV_GUILD_ID:
+                await self.tree.sync(guild=discord.Object(id=main_server))
             await self.tree.sync()
-            logger.info(f"Synced Commands successfully")
+            logger.info("Synced Commands successfully")
         except Exception as e:
             logger.error(f"Sync Commands | Error: {e}")
             raise e
-        logger.info("~End Syncing Guilds~")
+        logger.info("~End Syncing Commands~")
         loops(self)
-        startup_time_finish = time.time()
-        startup_time = round((startup_time_finish - startup_time_start)*1000,2)
-        logger.info(f"Bot startup successfully | Startup-Time: {startup_time} Milliseconds.")
-        if main_statusChannel != 0 and not maintenance:
-            return #await DiscordBot.send_status(self,"**Bot Online**",f"Startup-Time: {startup_time} Milliseconds.")
+        self.startup_time = round((time.time() - startup_time_start)*1000,2)
+
+    async def on_ready(self):
+        logger.info(f"Logged in as {self.user} | ID: {self.user.id} | Guilds: {len(self.guilds)} | Startup-Time: {self.startup_time} Milliseconds.")
 
     async def on_message(self,message):
-        if message.author == self.user:
+        if message.author == self.user or message.guild is None:
             return
         guild_id = message.guild.id
         if not db.check_if_guild_exists(guild_id):
@@ -221,24 +213,23 @@ class DiscordBot(commands.Bot):
         return
 
     async def on_guild_join(self,guild):
-        await self.wait_until_ready()
-        logger.info(f"~~~Start Syncing new Guild: [{guild.name}] ...~~~")
-        try:
-            await self.tree.sync(guild=discord.Object(id=guild.id))
-            logger.info(f"~~~Synced new Guild: [{guild.name}] successfully~~~")
-        except Exception as e:
-            logger.error(f"~~~Sync failed for Guild: [{guild.name}] , Error: {e}~~~")
-            raise e
+        # Global commands are available in new guilds automatically, no sync needed
+        logger.info(f"Joined Guild | {guild.name} | {guild.id}")
         return
 
-    async def on_guild_leave(self, guild):
+    # discord.py has no on_guild_leave event - on_guild_remove is the real one
+    async def on_guild_remove(self, guild):
         if db.check_if_guild_exists(guild.id):
             db.remove_guild(guild.id)
             logger.info(f"Left Guild | {guild.id} | Removed from Database")
         return
 
     async def send_status(self,status,info):
-        channel = self.get_guild(main_server).get_channel(main_statusChannel)
+        guild = self.get_guild(main_server)
+        channel = guild.get_channel(main_statusChannel) if guild else None
+        if channel is None:
+            logger.warning(f"send_status | status channel {main_statusChannel} not found")
+            return
         embed = get_embed(status,info)
         return await channel.send(embed=embed)
 
@@ -352,13 +343,6 @@ class DiscordBot(commands.Bot):
         channel_str = f"{channel.mention} | {channel.id}" if channel else f"Unknown Channel | {payload.channel_id}"
 
         message_id = payload.message_id
-        try:
-            if channel is not None:
-                message = await channel.fetch_message(message_id)
-                message_id = message.id
-        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
-            # Not critical for logging; we can still log the IDs.
-            pass
 
         emoji = str(payload.emoji)
         if len(emoji) > 100:
@@ -402,12 +386,6 @@ class DiscordBot(commands.Bot):
         channel_str = f"{channel.mention} | {channel.id}" if channel else f"Unknown Channel | {payload.channel_id}"
 
         message_id = payload.message_id
-        try:
-            if channel is not None:
-                message = await channel.fetch_message(message_id)
-                message_id = message.id
-        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
-            pass
 
         emoji = str(payload.emoji)
         if len(emoji) > 100:
@@ -445,12 +423,6 @@ class DiscordBot(commands.Bot):
         channel_str = f"{channel.mention} | {channel.id}" if channel else f"Unknown Channel | {payload.channel_id}"
 
         message_id = payload.message_id
-        try:
-            if channel is not None:
-                message = await channel.fetch_message(message_id)
-                message_id = message.id
-        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
-            pass
 
         link = build_message_link(guild_id, payload.channel_id, message_id)
         log = (
@@ -493,7 +465,8 @@ class DiscordBot(commands.Bot):
 
         guild = self.get_guild(guild_id)
 
-        log = f"**User ID:** {payload.user.id}\n**User Name:** {payload.user.name}\n**Member Count:** {guild.member_count}"
+        member_count = guild.member_count if guild else "Unknown"
+        log = f"**User ID:** {payload.user.id}\n**User Name:** {payload.user.name}\n**Member Count:** {member_count}"
         await self.send_logs(guild_id, "Member Left", log)
         return
     
@@ -888,25 +861,21 @@ class DiscordBot(commands.Bot):
 
 # Automation Tasks
 def loops(client):
-    @loop(hours=24)
-    async def check_service():
-        if main_server == 1345495816202227752 or defaultConfig["discordInvite"] != "https://discord.gg/mpgbu3M5Yy":
-            return
-        return
-    
     @loop(hours=12)
     async def clear_old_logs():
+        if not config.LOG_TO_FILE:
+            return
         clean_old_logs(LOG_DIR,BASE_LOG_NAME,RETENTION_DAYS)
         logger.info(f"Checked for Old Logs - {datetime.datetime.now(pytz.timezone(TIMEZONE)).strftime('%d.%m.%Y | %H:%M:%S')}")
 
     @loop(seconds=60)
     async def uptime_heartbeat():
-        if not os.path.exists("heartbeat.py"):
+        if Heartbeat is None:
             return
         global heartbeat_instance
         if heartbeat_instance is None:
             try:
-                heartbeat_instance = Heartbeat(client, port=HEALTH_CHECK_PORT)
+                heartbeat_instance = Heartbeat(client, port=config.HEALTH_CHECK_PORT)
                 await heartbeat_instance.start()
                 logger.info("Heartbeat Server initialisiert und gestartet")
             except Exception as e:
@@ -927,7 +896,6 @@ def loops(client):
         await client.wait_until_ready()
 
 
-    check_service.start()
     clear_old_logs.start()
         
 # Slash Commands
@@ -957,8 +925,8 @@ def bot_commands(client):
         db.update_guild_config(guild_id, logChannel=logchannel.id)
         
         logger.info(f"Setup executed for {interaction.guild.name} | {guild_id}")
+        await interaction.response.send_message(content=f"Setup was completed for ***{interaction.guild}*** | ***{guild_id}***")
         await client.send_logs(guild_id, "Setup", "completed successfully")
-        return await interaction.response.send_message(content=f"Setup was completed for ***{interaction.guild}*** | ***{guild_id}***")
 
     @client.tree.command(name="ltl_revoke_setup",description="Clears the Setup if you messed up")
     @app_commands.checks.has_permissions(manage_webhooks=True)
@@ -1000,6 +968,10 @@ def bot_commands(client):
             
         if not db.check_if_guild_exists(server_id_int):
             return await interaction.response.send_message(content="The /setup command wasn't executed on the other server yet!")
+
+        target_guild = client.get_guild(server_id_int)
+        if target_guild is None:
+            return await interaction.response.send_message(content="The bot is not on the other server anymore", ephemeral=True)
             
         guild_config = db.get_guild_config(guild_id)
         current_list = guild_config["logSendingToServerId"]
@@ -1011,8 +983,8 @@ def bot_commands(client):
         db.update_guild_config(guild_id, logSendingToServerId=current_list)
         
         logger.info(f"Added Forwarding Server {server_id_int} for {interaction.guild.name} | {guild_id}")
-        await client.send_logs(guild_id, "Forwarding-Server", f"{client.get_guild(server_id_int).name} was added to the forwarding list")
-        return await interaction.response.send_message(content=f"The Server {client.get_guild(server_id_int).name} | {server_id_int} was added successfully")
+        await interaction.response.send_message(content=f"The Server {target_guild.name} | {server_id_int} was added successfully")
+        await client.send_logs(guild_id, "Forwarding-Server", f"{target_guild.name} was added to the forwarding list")
     
     @client.tree.command(name="delete-forwarding-server",description="Deletes a Server from the forwarding list")
     @app_commands.checks.has_permissions(manage_webhooks=True)
@@ -1022,7 +994,10 @@ def bot_commands(client):
             
         guild_id = interaction.guild.id
         server_id_int = int(server_id)
-        
+
+        if not db.check_if_guild_exists(guild_id):
+            return await interaction.response.send_message(content="The /setup command wasn't executed yet!")
+
         guild_config = db.get_guild_config(guild_id)
         current_list = guild_config["logSendingToServerId"]
         
@@ -1032,9 +1007,11 @@ def bot_commands(client):
         current_list.remove(server_id_int)
         db.update_guild_config(guild_id, logSendingToServerId=current_list)
         
+        target_guild = client.get_guild(server_id_int)
+        target_name = target_guild.name if target_guild else "Unknown Server"
         logger.info(f"Removed Forwarding Server {server_id_int} for {interaction.guild.name} | {guild_id}")
-        await client.send_logs(guild_id, "Forwarding-Server", f"{client.get_guild(server_id_int).name} was removed from the forwarding list")
-        return await interaction.response.send_message(content=f"The Server {client.get_guild(server_id_int).name} | {server_id_int} was removed from the forwarding list")
+        await interaction.response.send_message(content=f"The Server {target_name} | {server_id_int} was removed from the forwarding list")
+        await client.send_logs(guild_id, "Forwarding-Server", f"{target_name} was removed from the forwarding list")
 
     @client.tree.command(name="self-logging",description="Enable/Disable Self Logging")
     @app_commands.checks.has_permissions(manage_webhooks=True)
@@ -1063,54 +1040,7 @@ def bot_commands(client):
 
     @client.tree.command(name="dev-discord",description="Get an Invite to the Devs Discord server.")
     async def dev_discord(interaction: discord.Interaction):
-        return await interaction.response.send_message(content=defaultConfig["discordInvite"],ephemeral=True)
-
-    @client.tree.command(name="create-embed",description="Send an Embed",guild=discord.Object(id=main_server))
-    @app_commands.checks.has_permissions(manage_webhooks=True)
-    async def createEmbed(interaction: discord.Interaction,title: str, description: str):
-        embed = get_embed(title,description)
-        embed.set_author(name=client.user.display_name,icon_url=client.user.display_avatar)
-        return await interaction.response.send_message(embed=embed)
-    
-    @client.tree.command(name="maintenance",description="Send a notification to the status channel | Bot Owner Only",guild=discord.Object(id=main_server))
-    @app_commands.checks.has_permissions(manage_webhooks=True)
-    async def maintenance(interaction: discord.Interaction,state: bool,time:int=0):
-        if interaction.user.id != bot_owner:
-            return await interaction.response.send_message(content="Only the Bot Owner is allowed to do this",ephemeral=True)
-        channel = client.get_channel(main_statusChannel)
-        if time == 0:
-            maintenance_time = "Unknown"
-        else:
-            maintenance_time = time
-        if state:
-            embed = get_embed("Maintenance",f"Bot will go into Maintenance for {maintenance_time} Minutes")
-            embed.color = discord.Colour.from_rgb(230,170,42)
-            if os.path.exists("E:/BotExtentions/LogTheLogger/ltl-bot.json"):
-                extentionConfig["maintenanceMode"] = state
-                with open("E:/BotExtentions/LogTheLogger/ltl-bot.json","w",encoding="utf-8") as nsc:
-                    json.dump(extentionConfig,nsc)
-            else:
-                defaultConfig["maintenanceMode"] = state
-                with open("default_config.json","w",encoding="utf-8") as nsc:
-                    json.dump(defaultConfig,nsc)
-        else:
-            embed = get_embed("Maintenance",f"Bot back Online after {maintenance_time} Minutes")
-            embed.color = discord.Colour.from_rgb(50,200,64)
-            if os.path.exists("E:/BotExtentions/LogTheLogger/ltl-bot.json"):
-                extentionConfig["maintenanceMode"] = state
-                with open("E:/BotExtentions/LogTheLogger/ltl-bot.json","w",encoding="utf-8") as nsc:
-                    json.dump(extentionConfig,nsc)
-            else:
-                defaultConfig["maintenanceMode"] = state
-                with open("default_config.json","w",encoding="utf-8") as nsc:
-                    json.dump(defaultConfig,nsc)
-        mode = ""
-        if state:
-            mode = "**Activated**"
-        else:
-            mode = "**Deactivated**"
-        await channel.send(embed=embed)
-        return await interaction.response.send_message(content=f"Maintenance message was delivered. Maintenance mode is now {mode}")
+        return await interaction.response.send_message(content=config.DISCORD_INVITE,ephemeral=True)
 
     @client.tree.error
     async def on_tree_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -1135,6 +1065,44 @@ def bot_commands(client):
             pass  # Ignore if we can't send error message
         raise error
 
+    # Owner-only commands live on the main server; skip them when it isn't configured
+    if not main_server:
+        return
+
+    @client.tree.command(name="create-embed",description="Send an Embed",guild=discord.Object(id=main_server))
+    @app_commands.checks.has_permissions(manage_webhooks=True)
+    async def createEmbed(interaction: discord.Interaction,title: str, description: str):
+        embed = get_embed(title,description)
+        embed.set_author(name=client.user.display_name,icon_url=client.user.display_avatar)
+        return await interaction.response.send_message(embed=embed)
+    
+    @client.tree.command(name="maintenance",description="Send a notification to the status channel | Bot Owner Only",guild=discord.Object(id=main_server))
+    @app_commands.checks.has_permissions(manage_webhooks=True)
+    async def maintenance_command(interaction: discord.Interaction,state: bool,time:int=0):
+        global maintenance
+        if interaction.user.id != bot_owner:
+            return await interaction.response.send_message(content="Only the Bot Owner is allowed to do this",ephemeral=True)
+        channel = client.get_channel(main_statusChannel)
+        if time == 0:
+            maintenance_time = "Unknown"
+        else:
+            maintenance_time = time
+        if state:
+            embed = get_embed("Maintenance",f"Bot will go into Maintenance for {maintenance_time} Minutes")
+            embed.color = discord.Colour.from_rgb(230,170,42)
+        else:
+            embed = get_embed("Maintenance",f"Bot back Online after {maintenance_time} Minutes")
+            embed.color = discord.Colour.from_rgb(50,200,64)
+        maintenance = state
+        mode = ""
+        if state:
+            mode = "**Activated**"
+        else:
+            mode = "**Deactivated**"
+        if channel is None:
+            return await interaction.response.send_message(content="Status channel not found, check DISCORD_STATUS_CHANNEL", ephemeral=True)
+        await channel.send(embed=embed)
+        return await interaction.response.send_message(content=f"Maintenance message was delivered. Maintenance mode is now {mode}")
 
 def run_discord_bot():
     intents = discord.Intents.default()
@@ -1144,14 +1112,12 @@ def run_discord_bot():
     intents.guild_messages = True
     intents.guild_reactions = True
     intents.guilds = True
-    intents.integrations = True
     intents.invites = True
     intents.members = True
     intents.message_content = True
     intents.messages = True
     intents.reactions = True
-    intents.typing = True
     intents.webhooks = True
     intents.voice_states = True
     client = DiscordBot(command_prefix="/", intents=intents)
-    client.run(token)
+    client.run(config.require_token())

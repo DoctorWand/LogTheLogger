@@ -5,7 +5,7 @@ This is the Roadmap for the Bot / Project
 - [x] Forwarding logs
 - [x] QoL, cleaning code & bug fixes
 
-## Version 2.0 ✅ COMPLETED
+## Version 2.0 🚧 MOSTLY COMPLETED
 ### Structure Change
 - [x] From JSON to SQLite Database (upgraded from TinyDB plan)
     - [x] For the server_config.json
@@ -13,26 +13,28 @@ This is the Roadmap for the Bot / Project
     - [x] Guild configuration management
     - [x] Log settings per guild
 
-### Self Logging ✅ COMPLETED
+### Self Logging 🚧 PARTIAL
 Logging -
 - [x] Profile Changes (Name, Profile Picture, Nickname, Roles, etc.)
-- [x] Role Changes (Role added to user, Role removed from user, Role created, Role deleted, etc.)
+- [x] Role Changes on members (Role added to user, Role removed from user)
+- [ ] Role created/deleted/updated events
 - [x] Message edit/deleted/bulk delete
 - [x] Member join/leave/ban/unban events
 - [x] Reaction add/remove/clear events
 - [x] Channel create/delete/update events
 - [x] Voice channel join/leave/move events
-- [x] Emoji and sticker events
-- [x] Webhook and invite events
+- [ ] Emoji and sticker events
+- [ ] Webhook and invite events
 
-### Additional Features Completed
+### Additional Features
 - [x] Comprehensive slash command system
 - [x] Database migration and setup commands
 - [x] Enhanced error handling and logging
-- [x] Configurable log settings per event type
+- [x] Log settings per event type stored in the database
+- [ ] Command to change log settings per event type
 - [x] Self-logging toggle functionality
 - [x] Maintenance mode support
-- [x] Cross-platform update system with backup creation
+- [ ] Cross-platform update system with backup creation
 - [x] Automated log cleanup with retention policies
 - [x] Multi-server forwarding support
 
@@ -45,6 +47,10 @@ Logging -
 - [ ] Scheduled maintenance windows
 - [ ] Export logs functionality
 - [ ] Automatic checks for updates for self hosted instances
+
+### Hosting
+- [x] Configuration via `.env` instead of JSON files
+- [x] Docker image and docker compose setup
 
 ### Performance & Scalability
 - [ ] Database optimization for large servers

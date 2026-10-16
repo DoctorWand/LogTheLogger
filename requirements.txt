@@ -1,4 +1,3 @@
-discord.py
-pytz
-packaging
-requests
+discord.py>=2.4,<3
+pytz>=2024.1
+python-dotenv>=1.0

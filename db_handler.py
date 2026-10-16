@@ -1,19 +1,21 @@
-import _sqlite3
+import sqlite3
 import os
 import json
 
+import config
+
 class DatabaseHandler:
     def __init__(self):
-        if not os.path.exists("F:/DiscordBotsData/LogTheLogger"):
-            self.DB_PATH = "ltl_database.db"
-        else:
-            self.DB_PATH = "F:/DiscordBotsData/LogTheLogger/ltl_database.db"
-        
+        self.DB_PATH = config.DATABASE_PATH
+        db_dir = os.path.dirname(self.DB_PATH)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+
         self.initialize_db()
 
     def initialize_db(self):
         """Initialize the database with required tables"""
-        conn = _sqlite3.connect(self.DB_PATH)
+        conn = sqlite3.connect(self.DB_PATH)
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -68,7 +70,7 @@ class DatabaseHandler:
 
     def connect_db(self):
         """Create database connection"""
-        return _sqlite3.connect(self.DB_PATH)
+        return sqlite3.connect(self.DB_PATH)
 
     def init_new_guild(self, guild_id: int, guild_name: str) -> None:
         """Initialize a new guild with default settings"""
