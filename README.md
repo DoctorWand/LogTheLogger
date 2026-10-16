@@ -1,7 +1,7 @@
 # LogTheLogger
 LogTheLogger is an Open Source Discord Bot for Logging onto another Discord Server
 
-Currently on Version 2.0 with comprehensive self-logging and database features
+Currently on Version 2.1 with comprehensive self-logging and database features
 - See [ROADMAP](ROADMAP.md) for more information
 
 ## Dev/Support Discord
@@ -25,17 +25,39 @@ Currently on Version 2.0 with comprehensive self-logging and database features
 5. Configure specific log types using the database settings
 
 ## Running your own instance
-1. Install [Python 3.13.3](https://www.python.org/downloads/release/python-3133/) or later
-2. Fill out the `default_config.json`:
-    1. `"discordToken"` -> Your Discord bot token
-    2. `"discordServer"` -> Your server id
-    3. `"discordStatusChannel"` -> Your status channel (if you don't have one, leave as 0)
-3. Run `install-requirements.bat` to install all dependencies
-4. Start the bot with `start.bat` or run `python main.py`
+All configuration lives in a `.env` file. Copy `.env.example` to `.env` and set at least `DISCORD_TOKEN`.
+Every option is explained in `.env.example`.
 
-> [!IMPORTANT]
-> Make sure you have Python 3.13.3 or later installed and added to your PATH.
-> Simply run `install-requirements.bat` to install all required dependencies automatically.
+### With Docker (recommended, e.g. on an Ubuntu server)
+1. Install Docker with the compose plugin
+2. Clone this repository and create the config: `cp .env.example .env`, then fill in `DISCORD_TOKEN`
+3. Create the data folder as your own user (the container runs as uid 1000): `mkdir data`
+4. Start the bot: `docker compose up -d --build`
+5. Follow the logs: `docker compose logs -f`
+
+Updating: `git pull && docker compose up -d --build`.
+The SQLite database is stored in `./data/ltl_database.db` and survives updates and restarts.
+
+### Without Docker
+1. Install [Python 3.13](https://www.python.org/downloads/) or later
+2. `cp .env.example .env` and fill in `DISCORD_TOKEN`
+3. `python -m pip install -r requirements.txt`
+4. `python main.py`
+
+### Migrating from 2.0 (default_config.json)
+`default_config.json` is no longer read. Move its values into `.env`:
+
+| default_config.json | .env |
+| --- | --- |
+| `discordToken` | `DISCORD_TOKEN` |
+| `discordServer` | `DISCORD_SERVER` |
+| `discordStatusChannel` | `DISCORD_STATUS_CHANNEL` |
+| `botOwner` | `BOT_OWNER` |
+| `maintenanceMode` | `MAINTENANCE_MODE` |
+| `discordInvite` | `DISCORD_INVITE` |
+
+Copy your existing `ltl_database.db` into the `data` folder (or set `DATABASE_PATH` to its location).
+Logs now go to the console; set `LOG_TO_FILE=true` to also write daily log files.
 
 ## Commands
 - `/ltl_setup` - Initial bot setup with log channel configuration
