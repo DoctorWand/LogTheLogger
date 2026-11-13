@@ -1,4 +1,5 @@
 # Imports
+import asyncio
 import discord
 import time
 import datetime
@@ -16,6 +17,7 @@ from discord.ext.tasks import loop
 from logging.handlers import TimedRotatingFileHandler
 import config
 from db_handler import db
+from channel_moves import find_moved_channels
 try:
     from heartbeat import Heartbeat
 except ImportError:
@@ -150,8 +152,18 @@ def loggingFromExternal(type: str, message: str):
         logger.error(message)
 
 # The Magic
+# Discord sends one channel update per shifted channel when a channel is dragged.
+# Position-only updates are collected for this long, then logged as one move.
+CHANNEL_MOVE_DEBOUNCE_SECONDS = 2.0
+
 class DiscordBot(commands.Bot):
     startup_time: float = 0.0
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # guild_id -> {channel_id: [first before snapshot, latest after snapshot]}
+        self._pending_channel_moves: dict[int, dict[int, list]] = {}
+        self._channel_move_tasks: dict[int, asyncio.Task] = {}
 
     async def _get_audit_actor(self, guild: discord.Guild, action: discord.AuditLogAction, target_id: int):
         try:
@@ -818,11 +830,6 @@ class DiscordBot(commands.Bot):
         if before_category != after_category:
             changes.append(f"**Category:** {before_category or 'None'} -> {after_category or 'None'}")
 
-        before_pos = getattr(before, 'position', None)
-        after_pos = getattr(after, 'position', None)
-        if before_pos != after_pos:
-            changes.append(f"**Position:** {before_pos} -> {after_pos}")
-
         before_nsfw = getattr(before, 'nsfw', None)
         after_nsfw = getattr(after, 'nsfw', None)
         if before_nsfw != after_nsfw:
@@ -839,8 +846,19 @@ class DiscordBot(commands.Bot):
         if before_slowmode != after_slowmode:
             changes.append(f"**Slowmode:** {before_slowmode} -> {after_slowmode}")
 
+        before_pos = getattr(before, 'position', None)
+        after_pos = getattr(after, 'position', None)
+        position_changed = before_pos != after_pos
+
         if not changes:
+            if position_changed:
+                # Position-only: may just be a side effect of another channel being
+                # dragged past this one. Collect and decide once the reorder is complete.
+                self._queue_channel_move(guild_id, before, after)
             return
+
+        if position_changed:
+            changes.append(f"**Position:** {before_pos} -> {after_pos}")
 
         actor = await self._get_audit_actor(after.guild, discord.AuditLogAction.channel_update, after.id)
         actor_str = f"{actor} | {actor.id}" if actor else "Unknown"
@@ -853,6 +871,54 @@ class DiscordBot(commands.Bot):
         )
         await self.send_logs(guild_id, "Channel Updated", log)
         return
+
+    def _queue_channel_move(self, guild_id: int, before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
+        pending = self._pending_channel_moves.setdefault(guild_id, {})
+        if after.id in pending:
+            pending[after.id][1] = after
+        else:
+            pending[after.id] = [before, after]
+
+        task = self._channel_move_tasks.get(guild_id)
+        if task and not task.done():
+            task.cancel()
+        self._channel_move_tasks[guild_id] = asyncio.create_task(self._flush_channel_moves(guild_id))
+
+    async def _flush_channel_moves(self, guild_id: int):
+        try:
+            await asyncio.sleep(CHANNEL_MOVE_DEBOUNCE_SECONDS)
+        except asyncio.CancelledError:
+            return  # a newer update for this guild restarted the timer
+        pending = self._pending_channel_moves.pop(guild_id, {})
+        self._channel_move_tasks.pop(guild_id, None)
+
+        entries = {
+            cid: (b, a) for cid, (b, a) in pending.items()
+            if getattr(b, 'position', None) != getattr(a, 'position', None)
+        }
+        if not entries:
+            return
+
+        moved_ids = find_moved_channels(
+            (cid, b.position, a.position) for cid, (b, a) in entries.items()
+        )
+        shifted = len(entries) - len(moved_ids)
+
+        for cid in moved_ids:
+            before, after = entries[cid]
+            try:
+                actor = await self._get_audit_actor(after.guild, discord.AuditLogAction.channel_update, after.id)
+                actor_str = f"{actor} | {actor.id}" if actor else "Unknown"
+                mention = getattr(after, 'mention', f"#{after.name}")
+                log = (
+                    f"**Channel:** {mention} | {after.id}\n"
+                    f"**Position:** {before.position} -> {after.position}\n"
+                    + (f"**Other channels shifted:** {shifted}\n" if shifted else "")
+                    + f"**Edited By:** {actor_str}"
+                )
+                await self.send_logs(guild_id, "Channel Moved", log)
+            except Exception as e:
+                logger.error(f"Channel move log failed for {guild_id}: {e}")
 
     async def on_guild_channel_pins_update(self, channel: discord.abc.GuildChannel, last_pin: datetime.datetime | None):
         guild_id = channel.guild.id
