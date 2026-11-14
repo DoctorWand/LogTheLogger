@@ -17,6 +17,8 @@ from discord.ext.tasks import loop
 from logging.handlers import TimedRotatingFileHandler
 import config
 from db_handler import db
+from checks import missing_log_channel_permissions, is_recent_audit_entry
+from log_types import LOG_TYPES
 from channel_moves import find_moved_channels
 try:
     from heartbeat import Heartbeat
@@ -141,6 +143,11 @@ def diff_message_content(before: str, after: str) -> str | None:
         return None
     return " ; ".join(parts)
 
+def avatar_change(before: discord.Asset | None, after: discord.Asset | None) -> str:
+    before_str = f"[Before]({before.url})" if before else "No Avatar"
+    after_str = f"[After]({after.url})" if after else "No Avatar"
+    return f"{before_str} -> {after_str}"
+
 # External Logging 
 def loggingFromExternal(type: str, message: str):
     type = type.lower()
@@ -165,14 +172,29 @@ class DiscordBot(commands.Bot):
         self._pending_channel_moves: dict[int, dict[int, list]] = {}
         self._channel_move_tasks: dict[int, asyncio.Task] = {}
 
-    async def _get_audit_actor(self, guild: discord.Guild, action: discord.AuditLogAction, target_id: int):
+    # Best-effort lookup of who triggered an event. Only entries from the last
+    # few seconds count, otherwise an old entry for the same target gets
+    # attributed to an unrelated new event. Returns None ("Unknown") rather
+    # than a guess when nothing recent matches.
+    async def _get_audit_actor(self, guild: discord.Guild, action: discord.AuditLogAction | tuple[discord.AuditLogAction, ...],
+                               target_id: int | None = None, channel_id: int | None = None):
+        actions = action if isinstance(action, tuple) else (action,)
         try:
             if not guild.me or not guild.me.guild_permissions.view_audit_log:
                 return None
-            async for entry in guild.audit_logs(limit=10, action=action):
-                target = getattr(entry, "target", None)
-                if getattr(target, "id", None) == target_id:
-                    return entry.user
+            now = discord.utils.utcnow()
+            # Several actions can't be filtered server side, so fetch unfiltered and filter here
+            kwargs = {"action": actions[0]} if len(actions) == 1 else {}
+            async for entry in guild.audit_logs(limit=10, **kwargs):
+                if entry.action not in actions:
+                    continue
+                if not is_recent_audit_entry(entry.created_at, now):
+                    continue
+                if target_id is not None and getattr(getattr(entry, "target", None), "id", None) != target_id:
+                    continue
+                if channel_id is not None and getattr(getattr(entry.extra, "channel", None), "id", None) != channel_id:
+                    continue
+                return entry.user
         except Exception:
             return None
         return None
@@ -579,15 +601,40 @@ class DiscordBot(commands.Bot):
         if before.pending != after.pending:
             changes.append(f"**Membership Screening:** {before.pending} -> {after.pending}")
 
-        if before.avatar != after.avatar:
-            before_avatar = before.avatar.url if before.avatar else "No Avatar"
-            after_avatar = after.avatar.url if after.avatar else "No Avatar"
-            changes.append(f"**Avatar Changed:** [Before]({before_avatar}) -> [After]({after_avatar})")
+        # Member.avatar is the global avatar and is shared between before/after,
+        # so comparing it here never fired. Server avatars live in guild_avatar,
+        # global changes arrive in on_user_update.
+        if before.guild_avatar != after.guild_avatar:
+            changes.append(f"**Server Avatar Changed:** {avatar_change(before.guild_avatar, after.guild_avatar)}")
 
         if changes:
             log = f"**User:** {before} | {before.id}\n" + "\n".join(changes)
             await self.send_logs(guild_id, "Member Updated", log)
         return
+
+    # Global profile changes (avatar, username, display name) are not tied to
+    # a server, so they are logged on every set up server the user is on.
+    async def on_user_update(self, before: discord.User, after: discord.User):
+        changes = []
+        if before.name != after.name:
+            changes.append(f"**Username:** {before.name} -> {after.name}")
+        if before.global_name != after.global_name:
+            changes.append(f"**Display Name:** {before.global_name} -> {after.global_name}")
+        if before.avatar != after.avatar:
+            changes.append(f"**Avatar Changed:** {avatar_change(before.avatar, after.avatar)}")
+        if not changes:
+            return
+
+        log = f"**User:** {after} | {after.id}\n" + "\n".join(changes)
+        for guild in after.mutual_guilds:
+            if not db.check_if_guild_exists(guild.id):
+                continue
+            if not db.get_guild_config(guild.id)["selfLogging"]:
+                continue
+            log_settings = db.get_log_settings(guild.id)
+            if not log_settings or not log_settings["memberUpdate"]:
+                continue
+            await self.send_logs(guild.id, "User Updated", log)
     
     async def on_raw_message_delete(self, payload):
         guild_id = payload.guild_id
@@ -612,7 +659,7 @@ class DiscordBot(commands.Bot):
         deleter = None
         guild = self.get_guild(guild_id)
         if guild is not None and author is not None:
-            deleter = await self._get_audit_actor(guild, discord.AuditLogAction.message_delete, author.id)
+            deleter = await self._get_audit_actor(guild, discord.AuditLogAction.message_delete, author.id, payload.channel_id)
 
         link = build_message_link(guild_id, payload.channel_id, message_id)
         lines = [
@@ -933,7 +980,11 @@ class DiscordBot(commands.Bot):
         if not log_settings.get("messageUpdate", False):
             return
 
-        actor = await self._get_audit_actor(channel.guild, discord.AuditLogAction.message_pin, channel.id)
+        actor = await self._get_audit_actor(
+            channel.guild,
+            (discord.AuditLogAction.message_pin, discord.AuditLogAction.message_unpin),
+            channel_id=channel.id,
+        )
         actor_str = f"{actor} | {actor.id}" if actor else "Unknown"
 
         last_pin_str = last_pin.strftime('%d.%m.%Y %H:%M:%S') if last_pin else "None"
@@ -1000,13 +1051,22 @@ def bot_commands(client):
         return await interaction.response.send_message(embed=embed)
 
     @client.tree.command(name="ltl_setup",description="Initial Setup.")
-    @app_commands.checks.has_permissions(manage_webhooks=True)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
     @app_commands.describe(logchannel = "The Channel where logs are getting send to.")
     async def ltl_setup(interaction: discord.Interaction, logchannel: discord.TextChannel):
         guild_id = interaction.guild.id
         if db.check_if_guild_exists(guild_id):
             return await interaction.response.send_message(content="Setup was already executed")
-            
+
+        # Without these the logs would silently never show up
+        missing = missing_log_channel_permissions(logchannel.permissions_for(interaction.guild.me))
+        if missing:
+            return await interaction.response.send_message(
+                content=f"I can't post logs in {logchannel.mention}. Missing permissions there: **{', '.join(missing)}**.\n"
+                        "Give me these permissions in that channel and run `/ltl_setup` again.",
+                ephemeral=True)
+
         db.init_new_guild(guild_id, interaction.guild.name)
         db.update_guild_config(guild_id, logChannel=logchannel.id)
         
@@ -1015,7 +1075,8 @@ def bot_commands(client):
         await client.send_logs(guild_id, "Setup", "completed successfully")
 
     @client.tree.command(name="ltl_revoke_setup",description="Clears the Setup if you messed up")
-    @app_commands.checks.has_permissions(manage_webhooks=True)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
     async def ltlRevokeSetup(interaction: discord.Interaction):
         guild_id = interaction.guild.id
         if not db.check_if_guild_exists(guild_id):
@@ -1026,7 +1087,8 @@ def bot_commands(client):
         return await interaction.response.send_message(content="Setup was revoked successfully")
 
     @client.tree.command(name="forwarding",description="Enable/Disable Log Forwarding")
-    @app_commands.checks.has_permissions(manage_webhooks=True)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
     async def forwarding(interaction: discord.Interaction, forwarding: bool=True):
         guild_id = interaction.guild.id
         if not db.check_if_guild_exists(guild_id):
@@ -1041,7 +1103,7 @@ def bot_commands(client):
     # /forwarding-server, Server B accepts it with /forwarding-accept.
     @client.tree.command(name="forwarding-server",description="Request to forward your logs to another server")
     @app_commands.guild_only()
-    @app_commands.checks.has_permissions(manage_webhooks=True)
+    @app_commands.default_permissions(manage_guild=True)
     async def forwardingServer(interaction: discord.Interaction, server_id: str):
         if not server_id.isdigit():
             return await interaction.response.send_message(content="Please enter a server id and not a server name")
@@ -1083,7 +1145,7 @@ def bot_commands(client):
 
     @client.tree.command(name="forwarding-accept",description="Accept logs being forwarded from another server")
     @app_commands.guild_only()
-    @app_commands.checks.has_permissions(manage_webhooks=True)
+    @app_commands.default_permissions(manage_guild=True)
     async def forwardingAccept(interaction: discord.Interaction, server_id: str):
         if not server_id.isdigit():
             return await interaction.response.send_message(content="Please enter a server id and not a server name")
@@ -1107,7 +1169,7 @@ def bot_commands(client):
 
     @client.tree.command(name="forwarding-deny",description="Deny or stop logs being forwarded from another server")
     @app_commands.guild_only()
-    @app_commands.checks.has_permissions(manage_webhooks=True)
+    @app_commands.default_permissions(manage_guild=True)
     async def forwardingDeny(interaction: discord.Interaction, server_id: str):
         if not server_id.isdigit():
             return await interaction.response.send_message(content="Please enter a server id and not a server name")
@@ -1127,7 +1189,7 @@ def bot_commands(client):
 
     @client.tree.command(name="forwarding-list",description="Show which servers you forward to and which forward to you")
     @app_commands.guild_only()
-    @app_commands.checks.has_permissions(manage_webhooks=True)
+    @app_commands.default_permissions(manage_guild=True)
     async def forwardingList(interaction: discord.Interaction):
         links = db.list_forwarding_links(interaction.guild.id)
 
@@ -1149,7 +1211,7 @@ def bot_commands(client):
 
     @client.tree.command(name="delete-forwarding-server",description="Deletes a Server from the forwarding list")
     @app_commands.guild_only()
-    @app_commands.checks.has_permissions(manage_webhooks=True)
+    @app_commands.default_permissions(manage_guild=True)
     async def deleteForwardingServer(interaction: discord.Interaction, server_id: str):
         if not server_id.isdigit():
             return await interaction.response.send_message(content="Please enter a server-id and not a server-name")
@@ -1170,7 +1232,8 @@ def bot_commands(client):
         await client.send_logs(guild_id, "Forwarding-Server", f"{target_name} was removed from the forwarding list")
 
     @client.tree.command(name="self-logging",description="Enable/Disable Self Logging")
-    @app_commands.checks.has_permissions(manage_webhooks=True)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
     async def selfLogging(interaction: discord.Interaction, selflogging: bool=True):
         guild_id = interaction.guild.id
         if not db.check_if_guild_exists(guild_id):
@@ -1180,6 +1243,33 @@ def bot_commands(client):
         logger.info(f"Self-Logging set to {selflogging} for {interaction.guild.name} | {guild_id}")
         await client.send_logs(guild_id, "Self-Logging", f"was set to {selflogging}")
         return await interaction.response.send_message(content=f"Self-Logging Statement is now: {selflogging}")
+
+    @client.tree.command(name="log-settings",description="Show or change which events get logged")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(log_type="The event type to change, leave empty to see all", enabled="Log this event type or not")
+    @app_commands.choices(log_type=[app_commands.Choice(name=label, value=key) for key, label in LOG_TYPES.items()])
+    async def logSettings(interaction: discord.Interaction, log_type: app_commands.Choice[str] | None = None, enabled: bool | None = None):
+        guild_id = interaction.guild.id
+        if not db.check_if_guild_exists(guild_id):
+            return await interaction.response.send_message(content="The /setup command wasn't executed yet!", ephemeral=True)
+
+        if log_type is not None and enabled is not None:
+            db.update_log_settings(guild_id, **{log_type.value: enabled})
+            state = "enabled" if enabled else "disabled"
+            logger.info(f"Log setting {log_type.value} set to {enabled} for {interaction.guild.name} | {guild_id}")
+            await client.send_logs(guild_id, "Log Settings", f"**{log_type.name}** was {state} by {interaction.user} | {interaction.user.id}")
+            return await interaction.response.send_message(content=f"**{log_type.name}** is now {state}.", ephemeral=True)
+
+        if log_type is not None or enabled is not None:
+            return await interaction.response.send_message(content="Pick both a log type and enabled, or neither to see the overview.", ephemeral=True)
+
+        log_settings = db.get_log_settings(guild_id)
+        lines = [f"{'✅' if log_settings.get(key) else '❌'} {label}" for key, label in LOG_TYPES.items()]
+        guild_config = db.get_guild_config(guild_id)
+        if not guild_config["selfLogging"]:
+            lines.append("\nSelf logging is off, so none of these are logged. Turn it on with `/self-logging true`.")
+        return await interaction.response.send_message(embed=get_embed("Log Settings", "\n".join(lines)), ephemeral=True)
 
     @client.tree.command(name="ltl-help",description="What? Where? When? How?")
     async def ltlHelp(interaction: discord.Interaction):
@@ -1193,7 +1283,9 @@ def bot_commands(client):
             "3. On Server B execute the 'forwarding-accept' command with Server As ID\n"
             "4. 'forwarding-list' shows all links, 'forwarding-deny' stops logs coming from a server\n\n"
             "**Which Permission do I need?**\n"
-            "For most of the Commands you need the 'Managed Webhooks' permission")
+            "The setup and forwarding commands need the 'Manage Server' permission by default.\n"
+            "Admins can change who may use them under Server Settings -> Integrations -> LogTheLogger.\n"
+            "Use `/log-settings` to turn single log types on or off.")
         return await interaction.response.send_message(embed=embed)
 
     @client.tree.command(name="dev-discord",description="Get an Invite to the Devs Discord server.")
@@ -1228,14 +1320,14 @@ def bot_commands(client):
         return
 
     @client.tree.command(name="create-embed",description="Send an Embed",guild=discord.Object(id=main_server))
-    @app_commands.checks.has_permissions(manage_webhooks=True)
+    @app_commands.default_permissions(manage_guild=True)
     async def createEmbed(interaction: discord.Interaction,title: str, description: str):
         embed = get_embed(title,description)
         embed.set_author(name=client.user.display_name,icon_url=client.user.display_avatar)
         return await interaction.response.send_message(embed=embed)
     
     @client.tree.command(name="maintenance",description="Send a notification to the status channel | Bot Owner Only",guild=discord.Object(id=main_server))
-    @app_commands.checks.has_permissions(manage_webhooks=True)
+    @app_commands.default_permissions(manage_guild=True)
     async def maintenance_command(interaction: discord.Interaction,state: bool,time:int=0):
         global maintenance
         if interaction.user.id != bot_owner:
