@@ -24,6 +24,26 @@ Currently on Version 2.1 with comprehensive self-logging and database features
 4. On server B execute `/forwarding-accept` with server A's id
     1. From now on the logs from server A show up on server B
 5. Use `/self-logging true` to enable the bot's own event logging
+6. Optional: use `/log-settings` to turn single event types on or off
+
+## Permissions
+### Bot
+| Permission | Why | Required |
+| --- | --- | --- |
+| View Channels | The bot only receives message, reaction and pin events for channels it can see, and it has to see the log channel | yes, everywhere you want logs from |
+| Send Messages | Posting logs, forwarded logs and forwarding requests | yes, in the log channel |
+| Embed Links | Every log is an embed | yes, in the log channel |
+| View Audit Log | Shows *who* changed roles, deleted a message, created/edited/deleted a channel or pinned a message | optional, otherwise `Unknown` |
+
+Administrator is not needed. Invite scopes: `bot` and `applications.commands`, permission integer `19584` (`19456` without View Audit Log).
+`/ltl_setup` refuses a log channel the bot can't post in.
+
+### Users
+All setup, forwarding and logging commands require **Manage Server** by default. Server admins can change who may use them under
+Server Settings → Integrations → LogTheLogger. `/info`, `/ltl-help` and `/dev-discord` are open to everyone.
+
+### Self-hosting
+Enable the **Server Members** and **Message Content** privileged intents for your bot in the Discord Developer Portal.
 
 ## Running your own instance
 All configuration lives in a `.env` file. Copy `.env.example` to `.env` and set at least `DISCORD_TOKEN`.
@@ -77,6 +97,7 @@ Logs now go to the console; set `LOG_TO_FILE=true` to also write daily log files
 - `/forwarding-list` - Show outgoing and incoming forwarding links and their status
 - `/delete-forwarding-server <server_id>` - Stop forwarding your logs to a server
 - `/self-logging <true/false>` - Enable/disable self event logging
+- `/log-settings [log_type] [enabled]` - Show which event types are logged, or turn a single one on/off
 - `/info` - Display bot information
 - `/ltl-help` - Show detailed help information
 
